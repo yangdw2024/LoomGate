@@ -1,0 +1,18 @@
+[package]
+name = "gateway-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone local edge daemon (127.0.0.1) wrapping gateway-core for Stage 1 CLI testing (Claude Code / OpenAI clients)."
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+gateway-core = { path = "../gateway-core" }
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

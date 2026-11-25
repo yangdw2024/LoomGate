@@ -1,0 +1,446 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+type TabId = "channels" | "takeover" | "trajectory";
+
+interface ChannelSnapshot {
+  id: string;
+  protocol: string;
+  health: "healthy" | "cooldown" | "quarantined";
+  inflight: number;
+  ewma_ttft_ms: number;
+  total_requests: number;
+}
+
+interface CliIntegrationStatus {
+  tool: "claude_code" | "codex" | "gemini_cli";
+  display_name: string;
+  config_path: string;
+  installed: boolean;
+  taken_over: boolean;
+  has_backup: boolean;
+  active_endpoint: string | null;
+}
+
+interface SessionSummary {
+  session_id: string;
+  workspace: string;
+  step_count: number;
+  fork_count: number;
+  total_cache_read_tokens: number;
+  total_input_tokens: number;
+  last_model: string;
+  updated_at_ms: number;
+}
+
+interface TrajectoryStep {
+  step_id: string;
+  session_id: string;
+  parent_step_id: string | null;
+  turn_index: number;
+  channel_id: string;
+  actual_model: string;
+  route_mode: string;
+  sticky_hit: boolean;
+  ttft_ms: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  status: string;
+  response_text: string;
+}
+
+interface ForkDiffResult {
+  original: TrajectoryStep;
+  forked: TrajectoryStep;
+  ttft_delta_ms: number;
+  output_tokens_delta: number;
+  cache_hit_ratio_delta: number;
+}
+
+const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+export default function App() {
+  const [tab, setTab] = useState<TabId>("channels");
+  const [bindAddr, setBindAddr] = useState("127.0.0.1:8787");
+  const [routeMode, setRouteMode] = useState<"lock" | "stage_aware">("lock");
+  const [channels, setChannels] = useState<ChannelSnapshot[]>([]);
+  const [clis, setClis] = useState<CliIntegrationStatus[]>([]);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [selectedSession, setSelectedSession] = useState<string | null>(null);
+  const [steps, setSteps] = useState<TrajectoryStep[]>([]);
+  const [forkModel, setForkModel] = useState("gpt-4o");
+  const [forkingStep, setForkingStep] = useState<string | null>(null);
+  const [diffResult, setDiffResult] = useState<ForkDiffResult | null>(null);
+  const [notice, setNotice] = useState<string>("");
+
+  async function refreshAll() {
+    if (!isTauri()) return;
+    const status = await invoke<{
+      bind_addr: string;
+      route_mode: "lock" | "stage_aware";
+      channels: ChannelSnapshot[];
+    }>("get_gateway_status");
+    setBindAddr(status.bind_addr);
+    setRouteMode(status.route_mode);
+    setChannels(status.channels);
+
+    const cliList = await invoke<CliIntegrationStatus[]>("list_cli_integrations");
+    setClis(cliList);
+
+    const sessList = await invoke<SessionSummary[]>("list_sessions");
+    setSessions(sessList);
+    if (selectedSession) {
+      const st = await invoke<TrajectoryStep[]>("get_session_steps", {
+        sessionId: selectedSession,
+      });
+      setSteps(st);
+    }
+  }
+
+  useEffect(() => {
+    refreshAll().catch((e) => setNotice(String(e)));
+    const timer = setInterval(() => {
+      refreshAll().catch(() => {});
+    }, 3000);
+    let unlisten: (() => void) | undefined;
+    if (isTauri()) {
+      listen<"lock" | "stage_aware">("route-mode-changed", (event) => {
+        setRouteMode(event.payload);
+        setNotice(`Tray hot-switched route mode to ${event.payload}`);
+      })
+        .then((fn) => {
+          unlisten = fn;
+        })
+        .catch(() => {});
+    }
+    return () => {
+      clearInterval(timer);
+      if (unlisten) unlisten();
+    };
+  }, [selectedSession]);
+
+  async function switchMode(mode: "lock" | "stage_aware") {
+    if (!isTauri()) return;
+    await invoke("set_route_mode", { mode });
+    setRouteMode(mode);
+    setNotice(`Route mode hot-switched to ${mode}`);
+  }
+
+  async function handleTakeover(tool: CliIntegrationStatus["tool"]) {
+    if (!isTauri()) return;
+    await invoke("takeover_cli_config", { tool });
+    await refreshAll();
+    setNotice(`Atomically took over ${tool} config (backup created).`);
+  }
+
+  async function handleRestore(tool: CliIntegrationStatus["tool"]) {
+    if (!isTauri()) return;
+    await invoke("restore_cli_config", { tool });
+    await refreshAll();
+    setNotice(`Restored original ${tool} config.`);
+  }
+
+  async function openSession(sessionId: string) {
+    setSelectedSession(sessionId);
+    setDiffResult(null);
+    if (!isTauri()) return;
+    const st = await invoke<TrajectoryStep[]>("get_session_steps", { sessionId });
+    setSteps(st);
+  }
+
+  async function handleFork(stepId: string) {
+    if (!isTauri()) return;
+    setForkingStep(stepId);
+    try {
+      const res = await invoke<ForkDiffResult>("fork_and_diff_step", {
+        stepId,
+        targetModel: forkModel,
+      });
+      setDiffResult(res);
+      if (selectedSession) {
+        const st = await invoke<TrajectoryStep[]>("get_session_steps", {
+          sessionId: selectedSession,
+        });
+        setSteps(st);
+      }
+    } catch (e) {
+      setNotice(`Fork failed: ${String(e)}`);
+    } finally {
+      setForkingStep(null);
+    }
+  }
+
+  return (
+    <div className="layout">
+      <header className="topbar">
+        <div className="brand">
+          <span>Edge Gateway</span>
+          <span className="pill ok">{bindAddr}</span>
+          <span className="pill">{routeMode === "lock" ? "Lock Mode" : "Stage-Aware"}</span>
+        </div>
+        <div className="tabs">
+          <button
+            className={`tab ${tab === "channels" ? "active" : ""}`}
+            onClick={() => setTab("channels")}
+          >
+            Channels &amp; Routing
+          </button>
+          <button
+            className={`tab ${tab === "takeover" ? "active" : ""}`}
+            onClick={() => setTab("takeover")}
+          >
+            CLI Takeover
+          </button>
+          <button
+            className={`tab ${tab === "trajectory" ? "active" : ""}`}
+            onClick={() => setTab("trajectory")}
+          >
+            Trajectory Fork &amp; Diff
+          </button>
+        </div>
+      </header>
+
+      <main className="main">
+        {notice && (
+          <div className="card row">
+            <span>{notice}</span>
+            <button className="btn secondary" onClick={() => setNotice("")}>
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {tab === "channels" && (
+          <>
+            <div className="card row">
+              <div>
+                <h3>Explicit Routing Policy (Zero Silent Downgrade)</h3>
+                <span style={{ color: "var(--muted)" }}>
+                  Hot-switch live without restarting active CLI terminals.
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  className={`btn ${routeMode === "lock" ? "" : "secondary"}`}
+                  onClick={() => switchMode("lock")}
+                >
+                  Lock Mode
+                </button>
+                <button
+                  className={`btn ${routeMode === "stage_aware" ? "" : "secondary"}`}
+                  onClick={() => switchMode("stage_aware")}
+                >
+                  Stage-Aware
+                </button>
+              </div>
+            </div>
+
+            <div className="card">
+              <h3>P2C Upstream Channel Pool</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Channel ID</th>
+                    <th>Protocol</th>
+                    <th>Health</th>
+                    <th>Inflight</th>
+                    <th>EWMA TTFT</th>
+                    <th>Total Req</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {channels.map((ch) => (
+                    <tr key={ch.id}>
+                      <td>{ch.id}</td>
+                      <td>{ch.protocol}</td>
+                      <td>
+                        <span
+                          className={`pill ${
+                            ch.health === "healthy"
+                              ? "ok"
+                              : ch.health === "cooldown"
+                              ? "warn"
+                              : "err"
+                          }`}
+                        >
+                          {ch.health}
+                        </span>
+                      </td>
+                      <td>{ch.inflight}</td>
+                      <td>{ch.ewma_ttft_ms} ms</td>
+                      <td>{ch.total_requests}</td>
+                    </tr>
+                  ))}
+                  {channels.length === 0 && (
+                    <tr>
+                      <td colSpan={6} style={{ color: "var(--muted)" }}>
+                        No channels loaded (launch via `npm run tauri dev` to connect to embedded kernel).
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+
+        {tab === "takeover" && (
+          <div className="card">
+            <h3>One-Click Atomic CLI Config Takeover (CC Switch Pattern)</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Client</th>
+                  <th>Config Path</th>
+                  <th>Status</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {clis.map((c) => (
+                  <tr key={c.tool}>
+                    <td>{c.display_name}</td>
+                    <td style={{ color: "var(--muted)", fontFamily: "monospace", fontSize: 12 }}>
+                      {c.config_path}
+                    </td>
+                    <td>
+                      <span className={`pill ${c.taken_over ? "ok" : ""}`}>
+                        {c.taken_over ? "Proxied" : "Direct"}
+                      </span>
+                    </td>
+                    <td style={{ display: "flex", gap: 8 }}>
+                      <button className="btn" onClick={() => handleTakeover(c.tool)}>
+                        {c.taken_over ? "Re-Apply" : "Take Over"}
+                      </button>
+                      {c.has_backup && (
+                        <button
+                          className="btn secondary"
+                          onClick={() => handleRestore(c.tool)}
+                        >
+                          Restore
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {tab === "trajectory" && (
+          <div className="grid-2">
+            <div className="card" style={{ overflow: "auto" }}>
+              <h3>Local SQLite Sessions</h3>
+              {sessions.map((s) => {
+                const totalIn = s.total_input_tokens + s.total_cache_read_tokens;
+                const hitPct =
+                  totalIn > 0 ? Math.round((s.total_cache_read_tokens / totalIn) * 100) : 0;
+                return (
+                  <div
+                    key={s.session_id}
+                    className={`session-item ${
+                      selectedSession === s.session_id ? "selected" : ""
+                    }`}
+                    onClick={() => openSession(s.session_id)}
+                  >
+                    <div className="row">
+                      <strong>{s.session_id}</strong>
+                      <span className="pill ok">KV {hitPct}%</span>
+                    </div>
+                    <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 4 }}>
+                      {s.last_model} · {s.step_count} steps · {s.fork_count} forks
+                    </div>
+                  </div>
+                );
+              })}
+              {sessions.length === 0 && (
+                <p style={{ color: "var(--muted)" }}>
+                  No local trajectories yet. Send requests through {bindAddr} to populate.
+                </p>
+              )}
+            </div>
+
+            <div className="card" style={{ overflow: "auto" }}>
+              <div className="row" style={{ marginBottom: 12 }}>
+                <h3 style={{ margin: 0 }}>Turn → Step Timeline &amp; Fork/Diff</h3>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ color: "var(--muted)", fontSize: 12 }}>Fork target model:</span>
+                  <input
+                    value={forkModel}
+                    onChange={(e) => setForkModel(e.target.value)}
+                    placeholder="gpt-4o / claude-sonnet-4-20250514"
+                  />
+                </div>
+              </div>
+
+              {diffResult && (
+                <div className="card" style={{ borderColor: "var(--accent)" }}>
+                  <div className="row">
+                    <strong>
+                      Fork Diff: {diffResult.original.actual_model} vs{" "}
+                      {diffResult.forked.actual_model}
+                    </strong>
+                    <span className="pill">
+                      TTFT Δ: {diffResult.ttft_delta_ms >= 0 ? "+" : ""}
+                      {diffResult.ttft_delta_ms} ms | Output Δ:{" "}
+                      {diffResult.output_tokens_delta >= 0 ? "+" : ""}
+                      {diffResult.output_tokens_delta} tok
+                    </span>
+                  </div>
+                  <div className="diff-grid">
+                    <div>
+                      <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                        Original ({diffResult.original.actual_model})
+                      </div>
+                      <pre>{diffResult.original.response_text}</pre>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                        Forked ({diffResult.forked.actual_model})
+                      </div>
+                      <pre>{diffResult.forked.response_text}</pre>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {steps.map((st) => {
+                const totalIn = st.input_tokens + st.cache_read_tokens;
+                const hitPct = totalIn > 0 ? Math.round((st.cache_read_tokens / totalIn) * 100) : 0;
+                return (
+                  <div
+                    key={st.step_id}
+                    className={`step-card ${st.parent_step_id ? "fork" : ""}`}
+                  >
+                    <div className="row">
+                      <div>
+                        <strong>
+                          Turn {st.turn_index} {st.parent_step_id ? "(Fork)" : ""}
+                        </strong>{" "}
+                        <span className="pill">{st.actual_model}</span>{" "}
+                        <span className="pill">{st.channel_id}</span>{" "}
+                        <span className="pill ok">KV {hitPct}%</span>{" "}
+                        <span className="pill">{st.ttft_ms} ms</span>
+                      </div>
+                      <button
+                        className="btn secondary"
+                        disabled={forkingStep === st.step_id}
+                        onClick={() => handleFork(st.step_id)}
+                      >
+                        {forkingStep === st.step_id ? "Forking..." : `Fork → ${forkModel}`}
+                      </button>
+                    </div>
+                    <pre style={{ marginTop: 8 }}>{st.response_text || "(empty response)"}</pre>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

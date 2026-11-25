@@ -1,0 +1,57 @@
+# Edge-Cloud Microkernel AI Gateway — Stage 1 Local Daemon Config
+
+[server]
+bind_addr = "127.0.0.1:8787"
+request_timeout_secs = 300
+
+[routing]
+# "lock" = strict model lock (never silent downgrade)
+# "stage_aware" = explicit rule-based routing by task stage header / heuristics
+default_mode = "lock"
+sticky_ttl_secs = 1800
+prefix_hash_turns = 4
+
+# Optional Stage-Aware rules (only active when mode = "stage_aware" or X-Gateway-Route-Mode: stage_aware)
+[routing.stage_models]
+title_generation = "gpt-4o-mini"
+file_search = "claude-3-5-haiku-20241022"
+code_edit = "claude-sonnet-4-20250514"
+architecture_reasoning = "claude-sonnet-4-20250514"
+
+[error_governance]
+# L1: Soft 429 / 502 transient jitter -> in-place retry with exponential backoff (no channel eviction)
+l1_max_retries = 2
+l1_base_backoff_ms = 1000
+l1_max_backoff_ms = 3000
+# L2: Hard RPM/TPM 429 -> short cooldown & seamless failover to healthy peer
+l2_cooldown_secs = 60
+# L3: Quota exhausted / 401 auth failure -> quarantine + unbind session affinity
+l3_quarantine_secs = 900
+# L4: 400 semantic / schema / safety refusal -> immediate passthrough, never retry
+
+# --- Upstream Channel Pool ---
+# Replace base_url & api_key with real endpoints, or point to tests/mock_upstream.py for local testing.
+
+[[channels]]
+id = "anthropic-primary"
+protocol = "anthropic"
+base_url = "http://127.0.0.1:18081"
+api_key = "sk-ant-mock-primary"
+weight = 100
+models = ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022"]
+
+[[channels]]
+id = "anthropic-backup"
+protocol = "anthropic"
+base_url = "http://127.0.0.1:18082"
+api_key = "sk-ant-mock-backup"
+weight = 100
+models = ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022"]
+
+[[channels]]
+id = "openai-primary"
+protocol = "openai"
+base_url = "http://127.0.0.1:18083"
+api_key = "sk-openai-mock-primary"
+weight = 100
+models = ["gpt-4o", "gpt-4o-mini", "o3-mini"]
