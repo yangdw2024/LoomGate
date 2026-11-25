@@ -3,7 +3,7 @@ use crate::ir::CanonicalRequest;
 use dashmap::DashMap;
 use rand::seq::SliceRandom;
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ pub struct ChannelRuntime {
     pub inflight: AtomicUsize,
     /// Exponentially Weighted Moving Average of streaming TTFT in milliseconds.
     ewma_ttft_ms: AtomicU64,
+    has_ttft_sample: AtomicBool,
     total_requests: AtomicU64,
     cooldown_until_ms: AtomicU64,
     quarantined_until_ms: AtomicU64,
@@ -33,6 +34,7 @@ impl ChannelRuntime {
             config,
             inflight: AtomicUsize::new(0),
             ewma_ttft_ms: AtomicU64::new(150),
+            has_ttft_sample: AtomicBool::new(false),
             total_requests: AtomicU64::new(0),
             cooldown_until_ms: AtomicU64::new(0),
             quarantined_until_ms: AtomicU64::new(0),
@@ -76,10 +78,15 @@ impl ChannelRuntime {
 
     /// Lock-free atomic EWMA update (alpha = 0.25) so concurrent requests never lose updates.
     pub fn record_ttft(&self, ttft_ms: u64) {
+        let clamped = ttft_ms.max(1);
+        if !self.has_ttft_sample.swap(true, Ordering::Relaxed) {
+            self.ewma_ttft_ms.store(clamped, Ordering::Relaxed);
+            return;
+        }
         let _ = self.ewma_ttft_ms.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
-            |prev| Some(((prev.saturating_mul(3).saturating_add(ttft_ms)) / 4).max(1)),
+            |prev| Some(((prev.saturating_mul(3).saturating_add(clamped)) / 4).max(1)),
         );
     }
 
@@ -95,12 +102,17 @@ impl ChannelRuntime {
     }
 
     pub fn snapshot(&self) -> ChannelSnapshot {
+        let ewma_ttft_ms = if self.has_ttft_sample.load(Ordering::Relaxed) {
+            Some(self.ewma_ttft_ms.load(Ordering::Relaxed))
+        } else {
+            None
+        };
         ChannelSnapshot {
             id: self.config.id.clone(),
             protocol: format!("{:?}", self.config.protocol).to_lowercase(),
             health: self.health(),
             inflight: self.inflight.load(Ordering::Relaxed),
-            ewma_ttft_ms: self.ewma_ttft_ms.load(Ordering::Relaxed),
+            ewma_ttft_ms,
             total_requests: self.total_requests.load(Ordering::Relaxed),
         }
     }
@@ -112,7 +124,7 @@ pub struct ChannelSnapshot {
     pub protocol: String,
     pub health: ChannelHealth,
     pub inflight: usize,
-    pub ewma_ttft_ms: u64,
+    pub ewma_ttft_ms: Option<u64>,
     pub total_requests: u64,
 }
 

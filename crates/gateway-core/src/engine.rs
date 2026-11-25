@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -233,6 +233,8 @@ pub struct GatewayEngine {
     trajectory: Arc<TrajectoryStore>,
     /// Hot-switchable global route mode (0 = Lock, 1 = StageAware) toggled from Tauri Tray.
     active_route_mode: AtomicU8,
+    /// Hot-updatable local inbound auth token (empty / None disables local auth).
+    local_auth_token: RwLock<Option<String>>,
     http: Client,
 }
 
@@ -268,21 +270,55 @@ impl GatewayEngine {
         ));
         let signatures = Arc::new(SignatureCache::new(Duration::from_secs(3600)));
 
+        let initial_token = config
+            .server
+            .local_auth_token
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+
         Ok(Self {
             config,
             router,
             signatures,
             trajectory,
             active_route_mode: AtomicU8::new(mode_byte),
+            local_auth_token: RwLock::new(initial_token),
             http,
         })
     }
 
     pub fn verify_inbound_auth(&self, provided_token: Option<&str>) -> bool {
-        match self.config.server.local_auth_token.as_deref() {
+        let guard = self
+            .local_auth_token
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_deref() {
             None | Some("") => true,
             Some(expected) => provided_token == Some(expected),
         }
+    }
+
+    pub fn local_auth_token(&self) -> Option<String> {
+        self.local_auth_token
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_local_auth_token(&self, token: Option<String>) {
+        let normalized = token.and_then(|s| {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        let mut guard = self
+            .local_auth_token
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = normalized;
     }
 
     pub fn format_error(

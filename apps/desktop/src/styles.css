@@ -74,6 +74,25 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .step-card.fork { border-left: 3px solid var(--accent); margin-left: 20px; }
 
 .diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.diff-box {
+  background: #090c10; border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 0; overflow: auto; max-height: 280px; margin-top: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+}
+.diff-line {
+  display: grid; grid-template-columns: 36px 36px 18px 1fr; padding: 1px 10px;
+  white-space: pre-wrap; word-break: break-word; line-height: 1.5;
+}
+.diff-line.add { background: rgba(63, 185, 80, 0.16); color: #aff5b4; }
+.diff-line.del { background: rgba(248, 81, 73, 0.16); color: #ffdcd7; }
+.diff-line.same { color: var(--muted); }
+.diff-ln { color: #6e7681; user-select: none; text-align: right; padding-right: 8px; }
+.diff-sigil { user-select: none; font-weight: 700; text-align: center; }
+.status-dot {
+  width: 9px; height: 9px; border-radius: 999px; display: inline-block;
+}
+.status-dot.lock { background: var(--accent); box-shadow: 0 0 6px rgba(56,139,253,0.7); }
+.status-dot.stage { background: var(--ok); box-shadow: 0 0 6px rgba(63,185,80,0.7); }
 pre {
   background: #090c10; border: 1px solid var(--border); border-radius: 6px;
   padding: 10px; overflow: auto; max-height: 240px; white-space: pre-wrap; font-size: 12px;

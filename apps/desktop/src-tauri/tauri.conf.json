@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Edge Gateway",
-  "version": "0.2.0",
-  "identifier": "dev.edgegateway.desktop",
+  "productName": "LoomGate",
+  "version": "0.2.1",
+  "identifier": "dev.loomgate.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Edge Gateway — Trajectory & Control Studio",
+        "title": "LoomGate — Control & Trajectory Studio",
         "width": 1160,
         "height": 760,
         "minWidth": 900,

@@ -15,9 +15,10 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, RunEvent, State as TauriState,
+    AppHandle, Emitter, Manager, RunEvent, State as TauriState,
 };
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -46,15 +47,160 @@ fn get_channel_snapshots(state: TauriState<'_, DesktopState>) -> Vec<ChannelSnap
     state.engine.channel_snapshots()
 }
 
+/// Renders a crisp 32x32 RGBA LoomGate tray icon with a live bottom-right status LED:
+/// - Lock mode: Blue LED (#388bfd)
+/// - Stage-Aware mode: Emerald LED (#3fb950)
+fn tray_icon_for_mode(mode: RouteMode) -> Image<'static> {
+    const SIZE: u32 = 32;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    let (led_r, led_g, led_b) = match mode {
+        RouteMode::Lock => (56u8, 139u8, 253u8),
+        RouteMode::StageAware => (63u8, 185u8, 80u8),
+    };
+
+    for y in 0..SIZE {
+        let ny = (y as f32 + 0.5) / SIZE as f32;
+        for x in 0..SIZE {
+            let nx = (x as f32 + 0.5) / SIZE as f32;
+            let ax = (nx - 0.5).abs() * 2.0;
+            let ay = (ny - 0.5).abs() * 2.0;
+            let r_sq = (ax.powi(4) + ay.powi(4)).powf(0.25);
+
+            // Bottom-right status indicator LED (with dark halo ring)
+            let dx = nx - 0.78;
+            let dy = ny - 0.78;
+            let led_dist = (dx * dx + dy * dy).sqrt();
+            if led_dist <= 0.16 {
+                rgba.extend_from_slice(&[led_r, led_g, led_b, 255]);
+                continue;
+            }
+            if led_dist <= 0.21 {
+                rgba.extend_from_slice(&[13, 17, 23, 255]);
+                continue;
+            }
+
+            if r_sq > 0.94 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+
+            let t = 0.5 * nx + 0.5 * ny;
+            let mut r = (16.0 + 24.0 * t) as u8;
+            let mut g = (24.0 + 62.0 * t) as u8;
+            let mut b = (58.0 + 112.0 * t) as u8;
+
+            let left_pillar = (0.22..=0.33).contains(&nx) && (0.24..=0.76).contains(&ny);
+            let right_pillar = (0.65..=0.76).contains(&nx) && (0.24..=0.60).contains(&ny);
+            let top_beam = (0.22..=0.76).contains(&nx) && (0.20..=0.30).contains(&ny);
+            let mid_weave = (0.28..=0.68).contains(&nx) && (0.46..=0.55).contains(&ny);
+            let base_bar = (0.22..=0.50).contains(&nx) && (0.66..=0.76).contains(&ny);
+
+            if left_pillar || right_pillar || top_beam || base_bar {
+                r = 242;
+                g = 246;
+                b = 255;
+            } else if mid_weave {
+                r = 56;
+                g = 189;
+                b = 248;
+            }
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+
+    Image::new_owned(rgba, SIZE, SIZE)
+}
+
+fn sync_tray_visuals(app: &AppHandle, bind_addr: &str, mode: RouteMode) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let label = match mode {
+            RouteMode::Lock => "Lock",
+            RouteMode::StageAware => "Stage-Aware",
+        };
+        let _ = tray.set_tooltip(Some(format!("LoomGate ({}) — {}", bind_addr, label)));
+        let _ = tray.set_icon(Some(tray_icon_for_mode(mode)));
+    }
+}
+
 #[tauri::command]
-fn set_route_mode(state: TauriState<'_, DesktopState>, mode: String) -> Result<String, String> {
+fn set_route_mode(
+    app: AppHandle,
+    state: TauriState<'_, DesktopState>,
+    mode: String,
+) -> Result<String, String> {
     let parsed = match mode.as_str() {
         "lock" => RouteMode::Lock,
         "stage_aware" => RouteMode::StageAware,
         other => return Err(format!("unsupported route mode: {}", other)),
     };
     state.engine.set_route_mode(parsed);
+    sync_tray_visuals(&app, &state.bind_addr, parsed);
     Ok(mode)
+}
+
+#[tauri::command]
+fn get_local_auth_token(state: TauriState<'_, DesktopState>) -> Option<String> {
+    state.engine.local_auth_token()
+}
+
+#[tauri::command]
+fn set_local_auth_token(
+    state: TauriState<'_, DesktopState>,
+    token: Option<String>,
+) -> Option<String> {
+    state.engine.set_local_auth_token(token);
+    state.engine.local_auth_token()
+}
+
+#[tauri::command]
+fn get_autostart_enabled() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "LoomGate",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        if enabled {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let quoted = format!("\"{}\"", exe.display());
+            let out = std::process::Command::new("reg")
+                .args(["add", RUN_KEY, "/v", "LoomGate", "/t", "REG_SZ", "/d", &quoted, "/f"])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            }
+            Ok(true)
+        } else {
+            let _ = std::process::Command::new("reg")
+                .args(["delete", RUN_KEY, "/v", "LoomGate", "/f"])
+                .output();
+            Ok(false)
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+        Err("autostart is only implemented for Windows in this build".into())
+    }
 }
 
 #[tauri::command]
@@ -204,12 +350,33 @@ async fn proxy_gemini(
     dispatch(engine, UpstreamProtocol::Gemini, headers, payload).await
 }
 
+fn extract_inbound_token(headers: &HeaderMap) -> Option<&str> {
+    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(k);
+    }
+    if let Some(k) = headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(k);
+    }
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+}
+
 async fn dispatch(
     engine: Arc<GatewayEngine>,
     protocol: UpstreamProtocol,
     headers: HeaderMap,
     payload: Value,
 ) -> Response {
+    if !engine.verify_inbound_auth(extract_inbound_token(&headers)) {
+        let body = engine.format_error(
+            protocol,
+            "authentication_error",
+            "invalid or missing local gateway token",
+        );
+        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    }
     let session_id = headers
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
@@ -329,19 +496,22 @@ pub fn run() {
             // 1. Spawn embedded Axum data plane on Tauri's Tokio runtime
             tauri::async_runtime::spawn(run_embedded_proxy(bg_engine, bg_bind, shutdown_rx));
 
-            // 2. Build lightweight System Tray with visible icon & live Route Mode hot-switching
-            let open_i = MenuItem::with_id(app, "open_studio", "Open Control Studio", true, None::<&str>)?;
+            // 2. Build lightweight System Tray with dynamic LoomGate status indicator & live hot-switching
+            let open_i = MenuItem::with_id(app, "open_studio", "Open LoomGate Studio", true, None::<&str>)?;
             let mode_lock = MenuItem::with_id(app, "mode_lock", "Route Mode: Lock (No Downgrade)", true, None::<&str>)?;
             let mode_stage = MenuItem::with_id(app, "mode_stage", "Route Mode: Stage-Aware", true, None::<&str>)?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit Edge Gateway", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit LoomGate", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_i, &mode_lock, &mode_stage, &quit_i])?;
 
-            let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+            let initial_mode = app.state::<DesktopState>().engine.active_route_mode();
+            let initial_label = match initial_mode {
+                RouteMode::Lock => "Lock",
+                RouteMode::StageAware => "Stage-Aware",
+            };
+            let tray_builder = TrayIconBuilder::with_id("main-tray")
                 .menu(&menu)
-                .tooltip(format!("Edge Gateway ({}) — Lock", tray_bind));
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
-            }
+                .icon(tray_icon_for_mode(initial_mode))
+                .tooltip(format!("LoomGate ({}) — {}", tray_bind, initial_label));
 
             let tooltip_bind = tray_bind.clone();
             let _tray = tray_builder
@@ -355,23 +525,13 @@ pub fn run() {
                     "mode_lock" => {
                         let st = app.state::<DesktopState>();
                         st.engine.set_route_mode(RouteMode::Lock);
-                        if let Some(tray) = app.tray_by_id("main-tray") {
-                            let _ = tray.set_tooltip(Some(format!(
-                                "Edge Gateway ({}) — Lock",
-                                tooltip_bind
-                            )));
-                        }
+                        sync_tray_visuals(app, &tooltip_bind, RouteMode::Lock);
                         let _ = app.emit("route-mode-changed", "lock");
                     }
                     "mode_stage" => {
                         let st = app.state::<DesktopState>();
                         st.engine.set_route_mode(RouteMode::StageAware);
-                        if let Some(tray) = app.tray_by_id("main-tray") {
-                            let _ = tray.set_tooltip(Some(format!(
-                                "Edge Gateway ({}) — Stage-Aware",
-                                tooltip_bind
-                            )));
-                        }
+                        sync_tray_visuals(app, &tooltip_bind, RouteMode::StageAware);
                         let _ = app.emit("route-mode-changed", "stage_aware");
                     }
                     "quit" => {
@@ -402,6 +562,10 @@ pub fn run() {
             get_gateway_status,
             get_channel_snapshots,
             set_route_mode,
+            get_local_auth_token,
+            set_local_auth_token,
+            get_autostart_enabled,
+            set_autostart_enabled,
             list_cli_integrations,
             takeover_cli_config,
             restore_cli_config,

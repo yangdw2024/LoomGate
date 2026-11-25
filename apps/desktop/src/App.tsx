@@ -9,7 +9,7 @@ interface ChannelSnapshot {
   protocol: string;
   health: "healthy" | "cooldown" | "quarantined";
   inflight: number;
-  ewma_ttft_ms: number;
+  ewma_ttft_ms: number | null;
   total_requests: number;
 }
 
@@ -59,6 +59,51 @@ interface ForkDiffResult {
   cache_hit_ratio_delta: number;
 }
 
+interface DiffLine {
+  kind: "same" | "del" | "add";
+  text: string;
+  oldLine?: number;
+  newLine?: number;
+}
+
+function computeLineDiff(oldText: string, newText: string): DiffLine[] {
+  const a = oldText.split(/\r?\n/);
+  const b = newText.split(/\r?\n/);
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const result: DiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) {
+      result.push({ kind: "same", text: a[i], oldLine: i + 1, newLine: j + 1 });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      result.push({ kind: "del", text: a[i], oldLine: i + 1 });
+      i++;
+    } else {
+      result.push({ kind: "add", text: b[j], newLine: j + 1 });
+      j++;
+    }
+  }
+  while (i < m) {
+    result.push({ kind: "del", text: a[i], oldLine: i + 1 });
+    i++;
+  }
+  while (j < n) {
+    result.push({ kind: "add", text: b[j], newLine: j + 1 });
+    j++;
+  }
+  return result;
+}
+
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export default function App() {
@@ -73,6 +118,11 @@ export default function App() {
   const [forkModel, setForkModel] = useState("gpt-4o");
   const [forkingStep, setForkingStep] = useState<string | null>(null);
   const [diffResult, setDiffResult] = useState<ForkDiffResult | null>(null);
+  const [diffViewMode, setDiffViewMode] = useState<"unified" | "split">("unified");
+  const [autostart, setAutostart] = useState<boolean>(false);
+  const [authTokenInput, setAuthTokenInput] = useState<string>("");
+  const [activeAuthToken, setActiveAuthToken] = useState<string | null>(null);
+  const [showAuthToken, setShowAuthToken] = useState<boolean>(false);
   const [notice, setNotice] = useState<string>("");
 
   async function refreshAll() {
@@ -98,6 +148,19 @@ export default function App() {
       setSteps(st);
     }
   }
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    invoke<boolean>("get_autostart_enabled")
+      .then(setAutostart)
+      .catch(() => {});
+    invoke<string | null>("get_local_auth_token")
+      .then((tok) => {
+        setActiveAuthToken(tok);
+        setAuthTokenInput(tok ?? "");
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     refreshAll().catch((e) => setNotice(String(e)));
@@ -126,6 +189,47 @@ export default function App() {
     await invoke("set_route_mode", { mode });
     setRouteMode(mode);
     setNotice(`Route mode hot-switched to ${mode}`);
+  }
+
+  async function toggleAutostart() {
+    if (!isTauri()) return;
+    try {
+      const next = await invoke<boolean>("set_autostart_enabled", { enabled: !autostart });
+      setAutostart(next);
+      setNotice(next ? "Launch at login enabled (Windows Run key)." : "Launch at login disabled.");
+    } catch (e) {
+      setNotice(`Autostart update failed: ${String(e)}`);
+    }
+  }
+
+  async function saveAuthToken() {
+    if (!isTauri()) return;
+    const saved = await invoke<string | null>("set_local_auth_token", {
+      token: authTokenInput.trim() || null,
+    });
+    setActiveAuthToken(saved);
+    setAuthTokenInput(saved ?? "");
+    setNotice(
+      saved
+        ? "Local inbound auth token active (enforced for x-api-key / Bearer / x-goog-api-key)."
+        : "Local inbound auth disabled (open localhost dev mode)."
+    );
+  }
+
+  async function clearAuthToken() {
+    if (!isTauri()) return;
+    await invoke<string | null>("set_local_auth_token", { token: null });
+    setActiveAuthToken(null);
+    setAuthTokenInput("");
+    setNotice("Local inbound auth token cleared.");
+  }
+
+  function generateRandomToken() {
+    const bytes = new Uint8Array(18);
+    crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    setAuthTokenInput(`lg_${hex}`);
+    setShowAuthToken(true);
   }
 
   async function handleTakeover(tool: CliIntegrationStatus["tool"]) {
@@ -176,7 +280,8 @@ export default function App() {
     <div className="layout">
       <header className="topbar">
         <div className="brand">
-          <span>Edge Gateway</span>
+          <span className={`status-dot ${routeMode === "lock" ? "lock" : "stage"}`} />
+          <span>LoomGate</span>
           <span className="pill ok">{bindAddr}</span>
           <span className="pill">{routeMode === "lock" ? "Lock Mode" : "Stage-Aware"}</span>
         </div>
@@ -269,7 +374,7 @@ export default function App() {
                         </span>
                       </td>
                       <td>{ch.inflight}</td>
-                      <td>{ch.ewma_ttft_ms} ms</td>
+                      <td>{ch.ewma_ttft_ms !== null ? `${ch.ewma_ttft_ms} ms` : "—"}</td>
                       <td>{ch.total_requests}</td>
                     </tr>
                   ))}
@@ -282,6 +387,65 @@ export default function App() {
                   )}
                 </tbody>
               </table>
+            </div>
+
+            <div className="card">
+              <h3>System &amp; Local Security</h3>
+              <div className="row" style={{ marginBottom: 14 }}>
+                <div>
+                  <strong>Launch LoomGate at Login</strong>
+                  <div style={{ color: "var(--muted)", fontSize: 12 }}>
+                    Registers current executable under HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
+                  </div>
+                </div>
+                <button
+                  className={`btn ${autostart ? "" : "secondary"}`}
+                  onClick={toggleAutostart}
+                >
+                  {autostart ? "Enabled" : "Disabled"}
+                </button>
+              </div>
+              <div className="row" style={{ alignItems: "flex-end", flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 260 }}>
+                  <div style={{ marginBottom: 4 }}>
+                    <strong>Local Inbound Auth Token</strong>{" "}
+                    <span className={`pill ${activeAuthToken ? "ok" : ""}`}>
+                      {activeAuthToken ? "Protected" : "Open Localhost"}
+                    </span>
+                  </div>
+                  <div style={{ color: "var(--muted)", fontSize: 12, marginBottom: 6 }}>
+                    When set, inbound requests to {bindAddr} must pass this token via{" "}
+                    <code>x-api-key</code>, <code>Authorization: Bearer</code>, or{" "}
+                    <code>x-goog-api-key</code>.
+                  </div>
+                  <input
+                    type={showAuthToken ? "text" : "password"}
+                    style={{ width: "100%", fontFamily: "monospace" }}
+                    value={authTokenInput}
+                    onChange={(e) => setAuthTokenInput(e.target.value)}
+                    placeholder="Leave empty to allow unauthenticated local CLI requests"
+                  />
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    className="btn secondary"
+                    onClick={() => setShowAuthToken((v) => !v)}
+                  >
+                    {showAuthToken ? "Hide" : "Show"}
+                  </button>
+                  <button className="btn secondary" onClick={generateRandomToken}>
+                    Generate
+                  </button>
+                  <button className="btn" onClick={saveAuthToken}>
+                    Save
+                  </button>
+                  {activeAuthToken && (
+                    <button className="btn secondary" onClick={clearAuthToken}>
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           </>
         )}
@@ -371,39 +535,71 @@ export default function App() {
                   <input
                     value={forkModel}
                     onChange={(e) => setForkModel(e.target.value)}
-                    placeholder="gpt-4o / claude-sonnet-4-20250514"
+                    placeholder="gpt-4o / gemini-2.5-pro / claude-sonnet-4-20250514"
                   />
                 </div>
               </div>
 
               {diffResult && (
                 <div className="card" style={{ borderColor: "var(--accent)" }}>
-                  <div className="row">
+                  <div className="row" style={{ flexWrap: "wrap" }}>
                     <strong>
                       Fork Diff: {diffResult.original.actual_model} vs{" "}
                       {diffResult.forked.actual_model}
                     </strong>
-                    <span className="pill">
-                      TTFT Δ: {diffResult.ttft_delta_ms >= 0 ? "+" : ""}
-                      {diffResult.ttft_delta_ms} ms | Output Δ:{" "}
-                      {diffResult.output_tokens_delta >= 0 ? "+" : ""}
-                      {diffResult.output_tokens_delta} tok
-                    </span>
-                  </div>
-                  <div className="diff-grid">
-                    <div>
-                      <div style={{ fontSize: 12, color: "var(--muted)" }}>
-                        Original ({diffResult.original.actual_model})
-                      </div>
-                      <pre>{diffResult.original.response_text}</pre>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span className="pill">
+                        TTFT Δ: {diffResult.ttft_delta_ms >= 0 ? "+" : ""}
+                        {diffResult.ttft_delta_ms} ms | Output Δ:{" "}
+                        {diffResult.output_tokens_delta >= 0 ? "+" : ""}
+                        {diffResult.output_tokens_delta} tok
+                      </span>
+                      <button
+                        className={`btn ${diffViewMode === "unified" ? "" : "secondary"}`}
+                        onClick={() => setDiffViewMode("unified")}
+                      >
+                        Line Diff
+                      </button>
+                      <button
+                        className={`btn ${diffViewMode === "split" ? "" : "secondary"}`}
+                        onClick={() => setDiffViewMode("split")}
+                      >
+                        Side-by-Side
+                      </button>
                     </div>
-                    <div>
-                      <div style={{ fontSize: 12, color: "var(--muted)" }}>
-                        Forked ({diffResult.forked.actual_model})
-                      </div>
-                      <pre>{diffResult.forked.response_text}</pre>
-                    </div>
                   </div>
+                  {diffViewMode === "unified" ? (
+                    <div className="diff-box">
+                      {computeLineDiff(
+                        diffResult.original.response_text || "",
+                        diffResult.forked.response_text || ""
+                      ).map((dl, idx) => (
+                        <div key={idx} className={`diff-line ${dl.kind}`}>
+                          <span className="diff-ln">{dl.oldLine ?? ""}</span>
+                          <span className="diff-ln">{dl.newLine ?? ""}</span>
+                          <span className="diff-sigil">
+                            {dl.kind === "add" ? "+" : dl.kind === "del" ? "-" : " "}
+                          </span>
+                          <span>{dl.text || " "}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="diff-grid">
+                      <div>
+                        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                          Original ({diffResult.original.actual_model})
+                        </div>
+                        <pre>{diffResult.original.response_text}</pre>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                          Forked ({diffResult.forked.actual_model})
+                        </div>
+                        <pre>{diffResult.forked.response_text}</pre>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
