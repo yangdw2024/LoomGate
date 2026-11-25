@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use rand::seq::SliceRandom;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -145,9 +145,10 @@ pub struct RouteDecision {
 
 /// Prefix-Cache Sticky + P2C Concurrency-Aware Router with Explicit Lock / Stage-Aware Modes.
 pub struct StickyP2cRouter {
-    channels: Vec<Arc<ChannelRuntime>>,
+    channels: RwLock<Vec<Arc<ChannelRuntime>>>,
     sticky_map: DashMap<String, StickyBinding>,
     config: RoutingConfig,
+    epoch: Instant,
 }
 
 impl StickyP2cRouter {
@@ -158,16 +159,41 @@ impl StickyP2cRouter {
             .map(|c| Arc::new(ChannelRuntime::new(c, epoch)))
             .collect();
         Self {
-            channels,
+            channels: RwLock::new(channels),
             sticky_map: DashMap::new(),
             config,
+            epoch,
         }
+    }
+
+    /// Hot-merges remote team-pool channels synced from Cloud Control Plane (upsert by channel ID).
+    pub fn merge_remote_channels(&self, remote: Vec<ChannelConfig>) -> usize {
+        let mut guard = self.channels.write().unwrap_or_else(|e| e.into_inner());
+        let mut merged = 0usize;
+        for cfg in remote {
+            let rt = Arc::new(ChannelRuntime::new(cfg.clone(), self.epoch));
+            if let Some(slot) = guard.iter_mut().find(|c| c.config.id == cfg.id) {
+                *slot = rt;
+            } else {
+                guard.push(rt);
+            }
+            merged += 1;
+        }
+        merged
+    }
+
+    pub fn channel_count(&self) -> usize {
+        self.channels
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Resets sticky bindings and channel cooldowns (used by test harness isolation).
     pub fn reset_state(&self) {
         self.sticky_map.clear();
-        for ch in &self.channels {
+        let guard = self.channels.read().unwrap_or_else(|e| e.into_inner());
+        for ch in guard.iter() {
             ch.clear_health_penalties();
         }
     }
@@ -202,10 +228,11 @@ impl StickyP2cRouter {
         let sticky_key = format!("{}::{}", actual_model, prefix_key);
         let now = Instant::now();
 
+        let channels_guard = self.channels.read().unwrap_or_else(|e| e.into_inner());
+
         if let Some(binding) = self.sticky_map.get(&sticky_key) {
             if binding.expires_at > now && !excluded_ids.contains(&binding.channel_id) {
-                if let Some(ch) = self
-                    .channels
+                if let Some(ch) = channels_guard
                     .iter()
                     .find(|c| c.config.id == binding.channel_id && c.is_available())
                 {
@@ -221,8 +248,7 @@ impl StickyP2cRouter {
             }
         }
 
-        let candidates: Vec<&Arc<ChannelRuntime>> = self
-            .channels
+        let candidates: Vec<&Arc<ChannelRuntime>> = channels_guard
             .iter()
             .filter(|c| {
                 c.is_available()
@@ -271,7 +297,12 @@ impl StickyP2cRouter {
     }
 
     pub fn snapshots(&self) -> Vec<ChannelSnapshot> {
-        self.channels.iter().map(|c| c.snapshot()).collect()
+        self.channels
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|c| c.snapshot())
+            .collect()
     }
 }
 

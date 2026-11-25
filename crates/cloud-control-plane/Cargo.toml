@@ -1,0 +1,18 @@
+[package]
+name = "cloud-control-plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LoomGate Stage 3 Cloud Control Plane: Team Pool Governance, Two-Phase Atomic Reserve/Settle Billing (Redis Lua spec), and ClickHouse Desensitized Telemetry."
+
+[dependencies]
+axum.workspace = true
+dashmap.workspace = true
+gateway-core = { path = "../gateway-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

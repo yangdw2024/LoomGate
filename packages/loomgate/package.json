@@ -1,0 +1,50 @@
+{
+  "name": "loomgate",
+  "version": "0.3.0",
+  "description": "Official TypeScript SDK & CLI for LoomGate — Edge-Cloud Hybrid Microkernel AI Gateway (Anthropic / OpenAI / Gemini lossless IR, Trajectory Fork & Diff, Onion Middleware, MCP Bridge, Cloud Control Plane).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "loomgate": "./bin/loomgate.mjs"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/sdk.test.mjs"
+  },
+  "keywords": [
+    "ai-gateway",
+    "llm-gateway",
+    "anthropic",
+    "openai",
+    "gemini",
+    "mcp",
+    "prompt-caching",
+    "loomgate",
+    "claude-code"
+  ],
+  "author": "yangdw2024",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yangdw2024/LoomGate.git"
+  },
+  "homepage": "https://github.com/yangdw2024/LoomGate#readme",
+  "bugs": {
+    "url": "https://github.com/yangdw2024/LoomGate/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

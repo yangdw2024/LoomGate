@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 
 GATEWAY = "http://127.0.0.1:8787"
+CLOUD_CONTROL_PLANE = "http://127.0.0.1:8790"
 UPSTREAMS = {
     "anthropic-primary": "http://127.0.0.1:18081",
     "anthropic-backup": "http://127.0.0.1:18082",
@@ -446,6 +447,86 @@ def test_10_onion_middleware_pipeline_and_outbound_guardrail():
     return f"layers={expected_layers}, 2 secrets/PII redacted before upstream"
 
 
+def test_11_edge_cloud_hybrid_login_billing_and_sanitized_telemetry():
+    reset_all()
+    # 11a. Login directly to Cloud Control Plane to register a team-only model channel
+    st_cp, _, cp_login = http_json(
+        "POST",
+        f"{CLOUD_CONTROL_PLANE}/api/v1/auth/login",
+        {"email": "dev@loomgate.dev", "password": "loomgate-dev-password"},
+    )
+    assert st_cp == 200, f"cloud control plane unreachable ({st_cp}): {cp_login}"
+    cp_token = cp_login["token"]
+    cp_auth = {"Authorization": f"Bearer {cp_token}"}
+
+    st_reg, _, reg_body = http_json(
+        "POST",
+        f"{CLOUD_CONTROL_PLANE}/api/v1/admin/channels",
+        {
+            "channel": {
+                "id": "team-cloud-openai",
+                "protocol": "openai",
+                "base_url": "http://127.0.0.1:18083",
+                "api_key": "sk-team-pool-key",
+                "weight": 100,
+                "models": ["gpt-4o-team"],
+            }
+        },
+        headers=cp_auth,
+    )
+    assert st_reg == 200, f"failed to register team channel: {st_reg} {reg_body}"
+
+    # 11b. Edge daemon logs in -> hot-merges team channel pool without restart
+    st_edge, _, edge_login = http_json(
+        "POST",
+        f"{GATEWAY}/api/cloud/login",
+        {
+            "control_plane_url": CLOUD_CONTROL_PLANE,
+            "email": "dev@loomgate.dev",
+            "password": "loomgate-dev-password",
+        },
+    )
+    assert st_edge == 200 and edge_login["cloud"]["connected"], f"edge cloud login failed: {st_edge} {edge_login}"
+    assert edge_login["cloud"]["synced_channels"] >= 1
+
+    try:
+        # 11c. Send request targeting the team-only model with a private sentinel string
+        sentinel = "CONFIDENTIAL_LOCAL_PROMPT_XYZ_9988"
+        st_req, h_req, _ = http_json(
+            "POST",
+            f"{GATEWAY}/v1/chat/completions",
+            {
+                "model": "gpt-4o-team",
+                "stream": False,
+                "messages": [{"role": "user", "content": f"Analyze {sentinel}"}],
+            },
+            headers={"X-Session-Id": "cloud-hybrid-sess"},
+        )
+        assert st_req == 200, f"team-pool routed request failed: {st_req}"
+        assert get_header(h_req, "X-Gateway-Channel-Id") == "team-cloud-openai"
+
+        # 11d. Verify atomic 2-phase reserve/settle closed cleanly with 0 leaked reservation
+        st_bal, _, bal = http_json("GET", f"{CLOUD_CONTROL_PLANE}/api/v1/billing/balance", headers=cp_auth)
+        assert st_bal == 200
+        assert bal["reserved_micros"] == 0, f"unreleased billing reservation: {bal}"
+        assert bal["total_settled_micros"] > 0, f"expected settled charge > 0: {bal}"
+
+        # 11e. Verify ClickHouse-compatible telemetry ingested metadata with ZERO raw prompt text
+        st_ana, _, ana = http_json("GET", f"{CLOUD_CONTROL_PLANE}/api/v1/telemetry/analytics", headers=cp_auth)
+        assert st_ana == 200
+        assert ana["summary"]["total_events"] >= 1
+        raw_ana = json.dumps(ana)
+        assert sentinel not in raw_ana, "PRIVACY BREACH: raw prompt leaked to cloud telemetry!"
+        assert "cloud-hybrid-sess" not in raw_ana, "PRIVACY BREACH: unhashed session_id leaked to cloud!"
+
+        return (
+            f"team channel hot-merged, settled={bal['total_settled_micros']} micro-USD "
+            f"(reserved=0), sanitized events={ana['summary']['total_events']} (0 raw text leaked)"
+        )
+    finally:
+        http_json("POST", f"{GATEWAY}/api/cloud/logout")
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -458,6 +539,7 @@ if __name__ == "__main__":
         ("8. Gemini Native & 3-Protocol Interop", test_8_gemini_native_and_three_protocol_interop),
         ("9. Gemini thought_signature Sidecar Restoration", test_9_gemini_thought_signature_sidecar_restoration),
         ("10. Stage 3 Onion Middleware & Guardrail Redaction", test_10_onion_middleware_pipeline_and_outbound_guardrail),
+        ("11. Stage 3 Edge-Cloud Sync, 2PC Billing & Sanitized Telemetry", test_11_edge_cloud_hybrid_login_billing_and_sanitized_telemetry),
     ]
     failed = 0
     for name, fn in tests:

@@ -1,3 +1,4 @@
+use crate::cloud_sync::{CloudSessionStatus, CloudSyncClient};
 use crate::codec::{codec_for, CodecError};
 use crate::config::{GatewayConfig, RouteMode, UpstreamProtocol};
 use crate::error_gov::{classify_upstream_error, ErrorTier};
@@ -247,6 +248,7 @@ pub struct GatewayEngine {
     router: Arc<StickyP2cRouter>,
     signatures: Arc<SignatureCache>,
     trajectory: Arc<TrajectoryStore>,
+    cloud: Arc<CloudSyncClient>,
     middleware: MiddlewarePipeline,
     rate_limiter: Arc<IngressRateLimitMiddleware>,
     memory: Arc<ContextMemoryMiddleware>,
@@ -321,11 +323,14 @@ impl GatewayEngine {
         middleware.push(Arc::clone(&memory) as Arc<dyn crate::middleware::Middleware>);
         middleware.push(Arc::clone(&mcp_bridge) as Arc<dyn crate::middleware::Middleware>);
 
+        let cloud = Arc::new(CloudSyncClient::new(http.clone()));
+
         Ok(Self {
             config,
             router,
             signatures,
             trajectory,
+            cloud,
             middleware,
             rate_limiter,
             memory,
@@ -334,6 +339,36 @@ impl GatewayEngine {
             local_auth_token: RwLock::new(initial_token),
             http,
         })
+    }
+
+    pub fn cloud_status(&self) -> CloudSessionStatus {
+        self.cloud.status()
+    }
+
+    pub async fn cloud_login(
+        &self,
+        control_plane_url: &str,
+        email: &str,
+        password: &str,
+    ) -> Result<CloudSessionStatus, String> {
+        let (_status, channels) = self
+            .cloud
+            .login_and_bootstrap(control_plane_url, email, password)
+            .await?;
+        let merged = self.router.merge_remote_channels(channels);
+        info!(merged_channels = merged, "synced team channel pool from LoomGate Cloud Control Plane");
+        Ok(self.cloud.status())
+    }
+
+    pub async fn cloud_sync_team_pool(&self) -> Result<CloudSessionStatus, String> {
+        let channels = self.cloud.fetch_team_channels().await?;
+        let merged = self.router.merge_remote_channels(channels);
+        info!(merged_channels = merged, "refreshed team channel pool from Cloud Control Plane");
+        Ok(self.cloud.status())
+    }
+
+    pub fn cloud_logout(&self) {
+        self.cloud.logout();
     }
 
     pub fn middleware_layers(&self) -> Vec<&'static str> {
@@ -607,7 +642,27 @@ impl GatewayEngine {
         let workspace = Some(mw_ctx.workspace.clone());
 
         let mut excluded_channels: Vec<String> = Vec::new();
-        let max_failovers = self.config.channels.len().max(1);
+        let max_failovers = self.router.channel_count().max(1);
+
+        // Phase 1 Cloud Billing Pre-Deduction (if Edge is connected to Cloud Control Plane)
+        let cloud_reserved = if self.cloud.is_connected() {
+            let est_tokens = u64::from(canonical.max_tokens.unwrap_or(1024)).max(256);
+            if let Err(msg) = self
+                .cloud
+                .reserve_billing(&request_id, &canonical.model, est_tokens)
+                .await
+            {
+                return Err(GatewayError::MiddlewareRejected {
+                    status: 402,
+                    error_type: "payment_required".into(),
+                    message: msg,
+                    middleware: "cloud_billing",
+                });
+            }
+            true
+        } else {
+            false
+        };
 
         for _failover_idx in 0..max_failovers {
             let decision = self
@@ -698,6 +753,8 @@ impl GatewayEngine {
                             let bg_metrics = Arc::clone(&metrics);
                             let bg_signatures = Arc::clone(&self.signatures);
                             let bg_traj = Arc::clone(&self.trajectory);
+                            let bg_cloud = Arc::clone(&self.cloud);
+                            let bg_req_id = request_id.clone();
                             let prefix_key = decision.prefix_key.clone();
                             let upstream_proto = channel.config.protocol;
                             let requested_model = canonical.model.clone();
@@ -815,16 +872,16 @@ impl GatewayEngine {
                                 };
 
                                 let step = TrajectoryStep {
-                                    step_id: step_id_bg,
+                                    step_id: step_id_bg.clone(),
                                     workspace: traj_workspace,
-                                    session_id: traj_session,
+                                    session_id: traj_session.clone(),
                                     parent_step_id: parent_bg,
                                     turn_index,
-                                    protocol: proto_str,
-                                    channel_id,
+                                    protocol: proto_str.clone(),
+                                    channel_id: channel_id.clone(),
                                     requested_model,
-                                    actual_model,
-                                    route_mode: mode_str,
+                                    actual_model: actual_model.clone(),
+                                    route_mode: mode_str.clone(),
                                     sticky_hit,
                                     ttft_ms,
                                     input_tokens: acc_usage.input_tokens,
@@ -837,6 +894,35 @@ impl GatewayEngine {
                                     created_at_ms: now_epoch_ms(),
                                 };
                                 let _ = bg_traj.append_step(&step);
+
+                                if cloud_reserved {
+                                    bg_cloud
+                                        .settle_billing(
+                                            &bg_req_id,
+                                            &actual_model,
+                                            acc_usage.input_tokens,
+                                            acc_usage.cache_read_input_tokens,
+                                            final_out_tokens,
+                                            false,
+                                        )
+                                        .await;
+                                    bg_cloud
+                                        .upload_sanitized_telemetry(
+                                            &traj_session,
+                                            &step_id_bg,
+                                            &proto_str,
+                                            &channel_id,
+                                            &actual_model,
+                                            &mode_str,
+                                            sticky_hit,
+                                            ttft_ms,
+                                            acc_usage.input_tokens,
+                                            acc_usage.cache_read_input_tokens,
+                                            final_out_tokens,
+                                            status_label,
+                                        )
+                                        .await;
+                                }
                             });
 
                             let stream = CancelPropagatingStream::new(
@@ -873,14 +959,14 @@ impl GatewayEngine {
                             let step = TrajectoryStep {
                                 step_id: step_id.clone(),
                                 workspace: traj_workspace,
-                                session_id: traj_session,
+                                session_id: traj_session.clone(),
                                 parent_step_id: parent_step_id.clone(),
                                 turn_index,
-                                protocol: proto_str,
+                                protocol: proto_str.clone(),
                                 channel_id: channel.config.id.clone(),
                                 requested_model: canonical.model.clone(),
                                 actual_model: upstream_model.clone(),
-                                route_mode: mode_str,
+                                route_mode: mode_str.clone(),
                                 sticky_hit: decision.sticky_hit,
                                 ttft_ms,
                                 input_tokens: canonical_resp.usage.input_tokens,
@@ -893,6 +979,35 @@ impl GatewayEngine {
                                 created_at_ms: now_epoch_ms(),
                             };
                             let _ = self.trajectory.append_step(&step);
+
+                            if cloud_reserved {
+                                self.cloud
+                                    .settle_billing(
+                                        &request_id,
+                                        &upstream_model,
+                                        canonical_resp.usage.input_tokens,
+                                        canonical_resp.usage.cache_read_input_tokens,
+                                        canonical_resp.usage.output_tokens,
+                                        false,
+                                    )
+                                    .await;
+                                self.cloud
+                                    .upload_sanitized_telemetry(
+                                        &traj_session,
+                                        &step_id,
+                                        &proto_str,
+                                        &channel.config.id,
+                                        &upstream_model,
+                                        &mode_str,
+                                        decision.sticky_hit,
+                                        ttft_ms,
+                                        canonical_resp.usage.input_tokens,
+                                        canonical_resp.usage.cache_read_input_tokens,
+                                        canonical_resp.usage.output_tokens,
+                                        "completed",
+                                    )
+                                    .await;
+                            }
 
                             return Ok(GatewayResponse::Json {
                                 meta,
@@ -951,6 +1066,11 @@ impl GatewayEngine {
                             break;
                         }
 
+                        if cloud_reserved {
+                            self.cloud
+                                .settle_billing(&request_id, &upstream_model, 0, 0, 0, true)
+                                .await;
+                        }
                         return Err(GatewayError::UpstreamError {
                             status,
                             body: err_body,
@@ -978,6 +1098,11 @@ impl GatewayEngine {
             }
         }
 
+        if cloud_reserved {
+            self.cloud
+                .settle_billing(&request_id, &canonical.model, 0, 0, 0, true)
+                .await;
+        }
         Err(GatewayError::NoAvailableChannel(canonical.model.clone()))
     }
 }

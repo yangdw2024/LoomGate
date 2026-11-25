@@ -59,6 +59,17 @@ interface ForkDiffResult {
   cache_hit_ratio_delta: number;
 }
 
+interface CloudSessionStatus {
+  connected: boolean;
+  control_plane_url: string | null;
+  email: string | null;
+  tenant_id: string | null;
+  synced_channels: number;
+  available_micros: number | null;
+  telemetry_uploaded: number;
+  last_sync_ms: number | null;
+}
+
 interface DiffLine {
   kind: "same" | "del" | "add";
   text: string;
@@ -123,6 +134,10 @@ export default function App() {
   const [authTokenInput, setAuthTokenInput] = useState<string>("");
   const [activeAuthToken, setActiveAuthToken] = useState<string | null>(null);
   const [showAuthToken, setShowAuthToken] = useState<boolean>(false);
+  const [cloudStatus, setCloudStatus] = useState<CloudSessionStatus | null>(null);
+  const [cloudUrl, setCloudUrl] = useState("http://127.0.0.1:8790");
+  const [cloudEmail, setCloudEmail] = useState("dev@loomgate.dev");
+  const [cloudPassword, setCloudPassword] = useState("loomgate-dev-password");
   const [notice, setNotice] = useState<string>("");
 
   async function refreshAll() {
@@ -138,6 +153,9 @@ export default function App() {
 
     const cliList = await invoke<CliIntegrationStatus[]>("list_cli_integrations");
     setClis(cliList);
+
+    const cloud = await invoke<CloudSessionStatus>("get_cloud_status");
+    setCloudStatus(cloud);
 
     const sessList = await invoke<SessionSummary[]>("list_sessions");
     setSessions(sessList);
@@ -230,6 +248,41 @@ export default function App() {
     const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
     setAuthTokenInput(`lg_${hex}`);
     setShowAuthToken(true);
+  }
+
+  async function handleCloudLogin() {
+    if (!isTauri()) return;
+    try {
+      const st = await invoke<CloudSessionStatus>("cloud_login", {
+        controlPlaneUrl: cloudUrl,
+        email: cloudEmail,
+        password: cloudPassword,
+      });
+      setCloudStatus(st);
+      await refreshAll();
+      setNotice(`Connected to Cloud Control Plane (${st.tenant_id}, ${st.synced_channels} team channels synced).`);
+    } catch (e) {
+      setNotice(`Cloud login failed: ${String(e)}`);
+    }
+  }
+
+  async function handleCloudSync() {
+    if (!isTauri()) return;
+    try {
+      const st = await invoke<CloudSessionStatus>("cloud_sync");
+      setCloudStatus(st);
+      await refreshAll();
+      setNotice(`Synced ${st.synced_channels} team channels from Cloud Control Plane.`);
+    } catch (e) {
+      setNotice(`Cloud sync failed: ${String(e)}`);
+    }
+  }
+
+  async function handleCloudLogout() {
+    if (!isTauri()) return;
+    const st = await invoke<CloudSessionStatus>("cloud_logout");
+    setCloudStatus(st);
+    setNotice("Disconnected from Cloud Control Plane (running in local-only privacy mode).");
   }
 
   async function handleTakeover(tool: CliIntegrationStatus["tool"]) {
@@ -446,6 +499,65 @@ export default function App() {
                   )}
                 </div>
               </div>
+            </div>
+
+            <div className="card">
+              <div className="row" style={{ marginBottom: 10 }}>
+                <h3 style={{ margin: 0 }}>Cloud Control Plane (Team Pool &amp; Sanitized Analytics)</h3>
+                <span className={`pill ${cloudStatus?.connected ? "ok" : ""}`}>
+                  {cloudStatus?.connected
+                    ? `Connected · ${cloudStatus.tenant_id}`
+                    : "Local-Only Mode"}
+                </span>
+              </div>
+              {cloudStatus?.connected ? (
+                <div className="row" style={{ flexWrap: "wrap" }}>
+                  <div style={{ color: "var(--muted)", fontSize: 13 }}>
+                    Account: <strong>{cloudStatus.email}</strong> · Balance:{" "}
+                    <strong>
+                      $
+                      {cloudStatus.available_micros !== null
+                        ? (cloudStatus.available_micros / 1_000_000).toFixed(4)
+                        : "0.0000"}
+                    </strong>{" "}
+                    · Synced Team Channels: <strong>{cloudStatus.synced_channels}</strong> ·
+                    Desensitized Events Uploaded: <strong>{cloudStatus.telemetry_uploaded}</strong>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn secondary" onClick={handleCloudSync}>
+                      Sync Team Pool
+                    </button>
+                    <button className="btn secondary" onClick={handleCloudLogout}>
+                      Disconnect
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <input
+                    style={{ minWidth: 200 }}
+                    value={cloudUrl}
+                    onChange={(e) => setCloudUrl(e.target.value)}
+                    placeholder="http://127.0.0.1:8790"
+                  />
+                  <input
+                    style={{ minWidth: 180 }}
+                    value={cloudEmail}
+                    onChange={(e) => setCloudEmail(e.target.value)}
+                    placeholder="dev@loomgate.dev"
+                  />
+                  <input
+                    type="password"
+                    style={{ minWidth: 160 }}
+                    value={cloudPassword}
+                    onChange={(e) => setCloudPassword(e.target.value)}
+                    placeholder="password"
+                  />
+                  <button className="btn" onClick={handleCloudLogin}>
+                    Sign In &amp; Sync Pool
+                  </button>
+                </div>
+              )}
             </div>
           </>
         )}

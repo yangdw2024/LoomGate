@@ -3,14 +3,15 @@ resolver = "2"
 members = [
     "crates/gateway-core",
     "crates/gateway-daemon",
+    "crates/cloud-control-plane",
     "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
-authors = ["Edge-Cloud Microkernel Gateway Contributors"]
+authors = ["LoomGate Contributors"]
 
 [workspace.dependencies]
 axum = { version = "0.7", features = ["http1", "http2", "json", "tokio"] }

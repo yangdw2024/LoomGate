@@ -1,66 +1,98 @@
-# Edge-Cloud Hybrid Microkernel AI Gateway — Stage 1 + Stage 2 (Rust + Tauri v2)
+# LoomGate
 
-本仓库已完整落地**阶段一（核心数据面内核）**与**阶段二（Tauri v2 系统托盘 + 一键原子接管 CLI 配置 + Append-Only 本地 SQLite 轨迹回放与多模型 Fork & Diff）**。
+**Edge-Cloud Hybrid Microkernel AI Gateway** (Rust Workspace + Tauri v2 Desktop + Onion Middleware + Cloud Control Plane + TypeScript SDK/CLI).
 
-## 仓库结构
+Built for local-first AI coding agents (Claude Code, Codex CLI, Gemini CLI) and team-scale AI engineering with **zero silent downgrade**, **lossless 3-protocol Canonical IR**, and **strict local privacy**.
+
+## Architecture Overview
 
 ```text
-edge-gateway/
-├── Cargo.toml                           # Rust Workspace 根配置（含 gateway-core / daemon / Tauri）
-├── config.example.toml                  # 上游渠道池、Lock/Stage-Aware 路由与四级熔断配置
-├── docs/
-│   ├── STAGE1_RFC.md                    # 阶段一核心内核设计文档
-│   └── STAGE2_RFC.md                    # 阶段二 Tauri 桌面端、原子接管与轨迹分叉设计文档
-├── crates/
-│   ├── gateway-core/                    # 纯 Rust 微内核库（内嵌进 Tauri 与 Daemon）
-│   │   └── src/
-│   │       ├── ir.rs                    # Lossless Canonical IR（cache_control / thinking / strict tool）
-│   │       ├── codec/{anthropic,openai}.rs
-│   │       ├── sse_fsm.rs               # 零缓冲 SSE 状态机 + Drop 驱动 Cancel Propagation
-│   │       ├── router.rs                # 前缀缓存亲和路由 + P2C 并发/TTFT 调度
-│   │       ├── error_gov.rs             # 四级 429/401/400 错误治理引擎
-│   │       ├── trajectory.rs            # SQLite WAL 仅追加轨迹引擎（Session → Turn → Step + Fork 树）
-│   │       ├── cli_takeover.rs          # Claude Code / Codex / Gemini CLI 原子配置接管与无损回滚
-│   │       └── engine.rs                # 统一调度、热切路由模式、Fork & Diff 执行
-│   └── gateway-daemon/                  # 独立本地守护进程（含 /api/sessions 与 /api/steps/:id/fork）
-├── apps/desktop/                        # Tauri v2 系统托盘 + React/Vite/TS 控制台
-│   ├── src-tauri/                       # 直接嵌入 gateway-core，零 IPC 开销
-│   └── src/App.tsx                      # 渠道监控 / 一键 CLI 接管 / 轨迹回放与 Fork Diff Studio
-└── tests/
-    ├── mock_upstream.py                 # 本地三渠道 Mock 上游
-    └── conformance_suite.py             # 阶段一 + 阶段二自动化契约测试（含 Fork & Diff 验证）
+  Claude Code / Codex / Gemini CLI / SDKs
+                     │
+       ┌─────────────▼─────────────┐
+       │  LoomGate Local Data Plane │  (gateway-daemon / Tauri v2 embedded on 127.0.0.1:8787)
+       │  • /v1/messages            │  Anthropic Messages API
+       │  • /v1/chat/completions    │  OpenAI Chat Completions API
+       │  • /v1beta/models/:action  │  Gemini Native (generateContent / streamGenerateContent?alt=sse)
+       └─────────────┬─────────────┘
+                     │
+       ┌─────────────▼───────────────────────────────────────────────┐
+       │  crates/gateway-core (Embeddable Microkernel)               │
+       │  1. Onion Middleware Pipeline:                              │
+       │     Ingress RateLimit → Guardrail (PII/Secret & Tool Block) │
+       │     → Context/Memory Injection → MCP Server Bridge          │
+       │  2. Lossless Canonical IR + Sidecar SignatureCache          │
+       │     (cache_control, thinking/signature, thought_signature,  │
+       │      strict Tool Schema, UTF-8 Zero-Buffer SSE FSM + Drop)  │
+       │  3. Prefix-Cache Sticky + P2C Router (Lock / Stage-Aware)   │
+       │  4. 4-Tier Error Governance (L1 / L2 / L3 / L4)             │
+       │  5. Local SQLite WAL Append-Only Trajectory + Fork & Diff   │
+       └──────┬──────────────────────────────────┬───────────────────┘
+              │ (Raw prompts stay LOCAL)          │ (Sanitized metadata ONLY)
+              ▼                                   ▼
+     Upstream LLM Channels             crates/cloud-control-plane (:8790)
+     (Anthropic / OpenAI / Gemini)     • Team Channel Pool Hot-Sync (PostgreSQL schema)
+                                       • Atomic 2-Phase Reserve/Settle Billing (Redis Lua)
+                                       • Desensitized Telemetry Analytics (ClickHouse)
 ```
 
-## 快速启动
+## Workspace Layout
 
-### 1. 运行 Rust 单元测试（含 SQLite 轨迹与原子配置接管测试）
+| Crate / Package | Description |
+|---|---|
+| `crates/gateway-core` | Pure embeddable microkernel: Anthropic/OpenAI/Gemini codecs, UTF-8 zero-buffer SSE FSM, Sticky P2C router, 4-tier error governance, SQLite WAL trajectory + Fork & Diff, atomic CLI takeover, onion `Middleware` pipeline, and `CloudSyncClient`. |
+| `crates/gateway-daemon` | Standalone local HTTP daemon (`127.0.0.1:8787`) exposing inference, trajectory, middleware/MCP, and cloud sync endpoints. |
+| `crates/cloud-control-plane` | Standalone Cloud Control Plane (`127.0.0.1:8790`) + production `deploy/` manifests (`postgres_schema.sql`, `redis_billing.lua`, `clickhouse_schema.sql`, `docker-compose.yml`). |
+| `apps/desktop` | Tauri v2 Desktop Control Studio embedding `gateway-core` in-process, with dynamic system tray status LED (Lock Blue / Stage-Aware Green), autostart, local auth token UI, CLI atomic takeover, Cloud Team sync, and line-level Fork & Diff view. |
+| `packages/loomgate` | Zero-dependency TypeScript SDK & CLI published on npm as [`loomgate`](https://www.npmjs.com/package/loomgate). |
+
+## Quickstart
+
+### 1. Build & Test (Rust Workspace)
 
 ```bash
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-### 2. 启动 Tauri v2 系统托盘与控制台（推荐）
+### 2. Run Full 11-Test Conformance Suite
+
+```bash
+# Terminal 1: Mock 4-channel cluster (Anthropic x2, OpenAI, Gemini)
+python tests/mock_upstream.py
+# Terminal 2: Cloud Control Plane
+cargo run -p cloud-control-plane
+# Terminal 3: Edge Daemon
+GATEWAY_CONFIG=config.example.toml cargo run -p gateway-daemon
+# Terminal 4: 11/11 Conformance Suite
+python tests/conformance_suite.py
+```
+
+### 3. Launch Tauri Desktop Studio
 
 ```bash
 cd apps/desktop
 npm install
-npm run tauri dev
+GATEWAY_CONFIG=../../config.example.toml npm run tauri dev
 ```
 
-启动后自动拉起内嵌代理 `127.0.0.1:8787` 与系统托盘菜单，支持：
-* 托盘菜单热切 `Lock` / `Stage-Aware` 路由模式（无需重启终端）；
-* **CLI Takeover** 页签一键原子接管 Claude Code、Codex CLI、Gemini CLI 配置，并自动生成 `.edge-gateway.bak` 备份以便一键还原；
-* **Trajectory Fork & Diff** 页签按会话查看每一步的 KV Cache 命中率与 TTFT，并从任意历史步骤一键 Fork 到其他模型重跑对比。
-
-### 3. 命令行模式与自动化契约测试
+### 4. Use the Official npm SDK & CLI
 
 ```bash
-# 终端 1：启动 3 个本地 Mock 上游
-python3 tests/mock_upstream.py
-
-# 终端 2：启动独立守护进程（自动落库至 .edge-gateway/trajectory.db）
-cargo run -p gateway-daemon -- config.example.toml
-
-# 终端 3：运行阶段一 + 阶段二全量契约测试
-python3 tests/conformance_suite.py
+npm install loomgate
+# or
+npx loomgate status
+npx loomgate sessions
+npx loomgate fork <step_id> gpt-4o
+npx loomgate cloud login http://127.0.0.1:8790 dev@loomgate.dev loomgate-dev-password
 ```
+
+## Security & Privacy Guarantees
+
+1. **Lossless Fidelity**: Every request, response, SSE frame, and error traverses Canonical IR — never silently dropping `cache_control`, `thinking/signature`, `thought_signature`, or `strict` tool schemas.
+2. **Explicit Transparent Routing**: `Lock` mode never silently downgrades; every response emits `X-Gateway-Actual-Model`, `X-Gateway-Channel-Id`, `X-Gateway-Route-Mode`, and `X-Gateway-Sticky-Hit`.
+3. **Local-First Privacy**: Full prompts and response bodies remain exclusively in local SQLite WAL. Cloud telemetry uses a strict schema containing only SHA-256 hashed session IDs and numeric/categorical metrics — and the Cloud Control Plane actively rejects any payload containing raw prompt/response fields.
+
+## License
+
+MIT

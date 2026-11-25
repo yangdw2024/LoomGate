@@ -1,4 +1,5 @@
 pub mod cli_takeover;
+pub mod cloud_sync;
 pub mod codec;
 pub mod config;
 pub mod engine;
@@ -11,6 +12,7 @@ pub mod sse_fsm;
 pub mod trajectory;
 
 pub use cli_takeover::{CliIntegrationStatus, CliTakeoverManager, CliTool, TakeoverError};
+pub use cloud_sync::{CloudSessionStatus, CloudSyncClient, SanitizedTelemetryUpload};
 pub use config::{ChannelConfig, GatewayConfig, MiddlewareConfig, RouteMode, UpstreamProtocol};
 pub use engine::{GatewayEngine, GatewayError, GatewayResponse, ResponseMetadata};
 pub use error_gov::ErrorTier;

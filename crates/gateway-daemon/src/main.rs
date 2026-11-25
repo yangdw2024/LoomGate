@@ -31,6 +31,13 @@ struct McpCallRequest {
     arguments: Value,
 }
 
+#[derive(Deserialize)]
+struct CloudLoginRequest {
+    control_plane_url: String,
+    email: String,
+    password: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -61,6 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/steps/:step_id/fork", post(fork_step))
         .route("/api/middleware", get(list_middleware))
         .route("/api/mcp/call", post(call_mcp_tool))
+        .route("/api/cloud/status", get(cloud_status))
+        .route("/api/cloud/login", post(cloud_login))
+        .route("/api/cloud/sync", post(cloud_sync))
+        .route("/api/cloud/logout", post(cloud_logout))
         .route("/v1/messages", post(handle_anthropic))
         .route("/v1/chat/completions", post(handle_openai))
         .route("/v1beta/models/:model_action", post(handle_gemini))
@@ -160,6 +171,44 @@ async fn call_mcp_tool(
         )
             .into_response(),
     }
+}
+
+async fn cloud_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.engine.cloud_status())
+}
+
+async fn cloud_login(
+    State(state): State<AppState>,
+    Json(req): Json<CloudLoginRequest>,
+) -> impl IntoResponse {
+    match state
+        .engine
+        .cloud_login(&req.control_plane_url, &req.email, &req.password)
+        .await
+    {
+        Ok(status) => Json(json!({ "ok": true, "cloud": status })).into_response(),
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn cloud_sync(State(state): State<AppState>) -> impl IntoResponse {
+    match state.engine.cloud_sync_team_pool().await {
+        Ok(status) => Json(json!({ "ok": true, "cloud": status })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn cloud_logout(State(state): State<AppState>) -> impl IntoResponse {
+    state.engine.cloud_logout();
+    Json(json!({ "ok": true, "cloud": state.engine.cloud_status() }))
 }
 
 async fn handle_anthropic(

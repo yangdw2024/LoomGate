@@ -7,9 +7,9 @@ use axum::{
     Json, Router,
 };
 use gateway_core::{
-    ChannelSnapshot, CliIntegrationStatus, CliTakeoverManager, CliTool, ForkDiffResult,
-    GatewayConfig, GatewayEngine, GatewayError, GatewayResponse, RouteMode, SessionSummary,
-    TrajectoryStep, UpstreamProtocol,
+    ChannelSnapshot, CliIntegrationStatus, CliTakeoverManager, CliTool, CloudSessionStatus,
+    ForkDiffResult, GatewayConfig, GatewayEngine, GatewayError, GatewayResponse, RouteMode,
+    SessionSummary, TrajectoryStep, UpstreamProtocol,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -201,6 +201,35 @@ fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
         let _ = enabled;
         Err("autostart is only implemented for Windows in this build".into())
     }
+}
+
+#[tauri::command]
+fn get_cloud_status(state: TauriState<'_, DesktopState>) -> CloudSessionStatus {
+    state.engine.cloud_status()
+}
+
+#[tauri::command]
+async fn cloud_login(
+    state: TauriState<'_, DesktopState>,
+    control_plane_url: String,
+    email: String,
+    password: String,
+) -> Result<CloudSessionStatus, String> {
+    state
+        .engine
+        .cloud_login(&control_plane_url, &email, &password)
+        .await
+}
+
+#[tauri::command]
+async fn cloud_sync(state: TauriState<'_, DesktopState>) -> Result<CloudSessionStatus, String> {
+    state.engine.cloud_sync_team_pool().await
+}
+
+#[tauri::command]
+fn cloud_logout(state: TauriState<'_, DesktopState>) -> CloudSessionStatus {
+    state.engine.cloud_logout();
+    state.engine.cloud_status()
 }
 
 #[tauri::command]
@@ -582,6 +611,10 @@ pub fn run() {
             set_local_auth_token,
             get_autostart_enabled,
             set_autostart_enabled,
+            get_cloud_status,
+            cloud_login,
+            cloud_sync,
+            cloud_logout,
             list_cli_integrations,
             takeover_cli_config,
             restore_cli_config,
