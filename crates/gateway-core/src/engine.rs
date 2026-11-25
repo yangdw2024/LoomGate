@@ -2,6 +2,11 @@ use crate::codec::{codec_for, CodecError};
 use crate::config::{GatewayConfig, RouteMode, UpstreamProtocol};
 use crate::error_gov::{classify_upstream_error, ErrorTier};
 use crate::ir::{CanonicalRequest, CanonicalStreamEvent, CanonicalUsage, ContentPart};
+use crate::middleware::guardrail::GuardrailMiddleware;
+use crate::middleware::ingress::IngressRateLimitMiddleware;
+use crate::middleware::mcp_bridge::McpBridgeMiddleware;
+use crate::middleware::memory::ContextMemoryMiddleware;
+use crate::middleware::{MiddlewareContext, MiddlewarePipeline};
 use crate::router::{ChannelRuntime, ChannelSnapshot, StickyP2cRouter};
 use crate::signature_cache::SignatureCache;
 use crate::sse_fsm::{CancelPropagatingStream, SseFrameParser, StreamMetrics};
@@ -13,7 +18,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
@@ -40,6 +45,13 @@ pub enum GatewayError {
         body: String,
         tier: ErrorTier,
     },
+    #[error("middleware '{middleware}' rejected request (HTTP {status}): {message}")]
+    MiddlewareRejected {
+        status: u16,
+        error_type: String,
+        message: String,
+        middleware: &'static str,
+    },
     #[error("transport error: {0}")]
     Transport(String),
 }
@@ -54,6 +66,7 @@ pub struct ResponseMetadata {
     pub route_mode: RouteMode,
     pub sticky_hit: bool,
     pub prefix_key: String,
+    pub extra_headers: BTreeMap<String, String>,
 }
 
 impl ResponseMetadata {
@@ -72,6 +85,9 @@ impl ResponseMetadata {
         );
         h.insert("X-Gateway-Sticky-Hit".into(), self.sticky_hit.to_string());
         h.insert("X-Gateway-Prefix-Key".into(), self.prefix_key.clone());
+        for (k, v) in &self.extra_headers {
+            h.insert(k.clone(), v.clone());
+        }
         h
     }
 }
@@ -231,6 +247,10 @@ pub struct GatewayEngine {
     router: Arc<StickyP2cRouter>,
     signatures: Arc<SignatureCache>,
     trajectory: Arc<TrajectoryStore>,
+    middleware: MiddlewarePipeline,
+    rate_limiter: Arc<IngressRateLimitMiddleware>,
+    memory: Arc<ContextMemoryMiddleware>,
+    mcp_bridge: Arc<McpBridgeMiddleware>,
     /// Hot-switchable global route mode (0 = Lock, 1 = StageAware) toggled from Tauri Tray.
     active_route_mode: AtomicU8,
     /// Hot-updatable local inbound auth token (empty / None disables local auth).
@@ -276,15 +296,52 @@ impl GatewayEngine {
             .clone()
             .filter(|s| !s.trim().is_empty());
 
+        let rate_limiter = Arc::new(IngressRateLimitMiddleware::new(
+            config.middleware.rpm_limit,
+            config.middleware.rate_limit_burst,
+        ));
+        let guardrail = Arc::new(GuardrailMiddleware {
+            redact_secrets: config.middleware.redact_secrets,
+            redact_pii: config.middleware.redact_pii,
+            blocked_tools: config.middleware.blocked_tools.clone(),
+            blocked_arg_patterns: config.middleware.blocked_arg_patterns.clone(),
+        });
+        let memory = Arc::new(ContextMemoryMiddleware::new(
+            config.middleware.memory_enabled,
+            config.middleware.memory_facts.clone(),
+            config.middleware.memory_max_entries,
+        ));
+        let mcp_bridge = Arc::new(McpBridgeMiddleware::new(
+            config.middleware.mcp_servers.clone(),
+        ));
+
+        let mut middleware = MiddlewarePipeline::new();
+        middleware.push(Arc::clone(&rate_limiter) as Arc<dyn crate::middleware::Middleware>);
+        middleware.push(guardrail);
+        middleware.push(Arc::clone(&memory) as Arc<dyn crate::middleware::Middleware>);
+        middleware.push(Arc::clone(&mcp_bridge) as Arc<dyn crate::middleware::Middleware>);
+
         Ok(Self {
             config,
             router,
             signatures,
             trajectory,
+            middleware,
+            rate_limiter,
+            memory,
+            mcp_bridge,
             active_route_mode: AtomicU8::new(mode_byte),
             local_auth_token: RwLock::new(initial_token),
             http,
         })
+    }
+
+    pub fn middleware_layers(&self) -> Vec<&'static str> {
+        self.middleware.layer_names()
+    }
+
+    pub fn mcp_bridge(&self) -> Arc<McpBridgeMiddleware> {
+        Arc::clone(&self.mcp_bridge)
     }
 
     pub fn verify_inbound_auth(&self, provided_token: Option<&str>) -> bool {
@@ -333,6 +390,8 @@ impl GatewayEngine {
     pub fn reset_runtime_state(&self) {
         self.router.reset_state();
         self.signatures.clear();
+        self.rate_limiter.reset();
+        self.memory.clear();
     }
 
     pub fn active_route_mode(&self) -> RouteMode {
@@ -477,8 +536,75 @@ impl GatewayEngine {
         let raw_request_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
 
         let downstream_codec = codec_for(downstream_protocol);
-        let mut canonical = downstream_codec.decode_request(&payload, session_id, task_stage)?;
+        let canonical = downstream_codec.decode_request(&payload, session_id, task_stage)?;
         let effective_mode = override_mode.or_else(|| Some(self.active_route_mode()));
+
+        let client_key = canonical
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
+        let ws = workspace.clone().unwrap_or_else(|| "default".to_string());
+        let mw_ctx = MiddlewareContext::new(
+            request_id.clone(),
+            downstream_protocol,
+            client_key,
+            ws,
+            canonical,
+        );
+
+        let mw_outcome = self
+            .middleware
+            .execute(mw_ctx, |mut ctx| {
+                Box::pin(async move {
+                    let res = self
+                        .dispatch_upstream(
+                            &mut ctx,
+                            step_id,
+                            raw_request_json,
+                            effective_mode,
+                            parent_step_id,
+                            fixed_turn_index,
+                        )
+                        .await;
+                    (ctx, res)
+                })
+            })
+            .await;
+
+        match mw_outcome {
+            Err(rej) => Err(GatewayError::MiddlewareRejected {
+                status: rej.status,
+                error_type: rej.error_type,
+                message: rej.message,
+                middleware: rej.middleware,
+            }),
+            Ok((final_ctx, Ok(mut resp))) => {
+                match &mut resp {
+                    GatewayResponse::Streaming { meta, .. }
+                    | GatewayResponse::Json { meta, .. } => {
+                        meta.extra_headers.extend(final_ctx.annotations);
+                    }
+                }
+                Ok(resp)
+            }
+            Ok((_, Err(e))) => Err(e),
+        }
+    }
+
+    async fn dispatch_upstream(
+        &self,
+        mw_ctx: &mut MiddlewareContext,
+        step_id: String,
+        raw_request_json: String,
+        effective_mode: Option<RouteMode>,
+        parent_step_id: Option<String>,
+        fixed_turn_index: Option<i64>,
+    ) -> Result<GatewayResponse, GatewayError> {
+        let request_id = mw_ctx.request_id.clone();
+        let downstream_protocol = mw_ctx.downstream_protocol;
+        let downstream_codec = codec_for(downstream_protocol);
+        let canonical = &mut mw_ctx.request;
+        let workspace = Some(mw_ctx.workspace.clone());
 
         let mut excluded_channels: Vec<String> = Vec::new();
         let max_failovers = self.config.channels.len().max(1);
@@ -486,18 +612,18 @@ impl GatewayEngine {
         for _failover_idx in 0..max_failovers {
             let decision = self
                 .router
-                .select_channel(&canonical, effective_mode, &excluded_channels)
+                .select_channel(canonical, effective_mode, &excluded_channels)
                 .ok_or_else(|| GatewayError::NoAvailableChannel(canonical.model.clone()))?;
 
             // Hydrate sidecar-cached thinking signatures before encoding upstream request.
-            self.hydrate_signatures(&decision.prefix_key, &mut canonical);
+            self.hydrate_signatures(&decision.prefix_key, canonical);
 
             let channel = Arc::clone(&decision.channel);
             let upstream_codec = codec_for(channel.config.protocol);
             let same_protocol = downstream_protocol == channel.config.protocol;
             let upstream_model = channel.config.resolve_upstream_model(&decision.actual_model);
             let encoded_body =
-                upstream_codec.encode_request(&canonical, &upstream_model, same_protocol)?;
+                upstream_codec.encode_request(canonical, &upstream_model, same_protocol)?;
             let endpoint = upstream_endpoint(
                 &channel.config.base_url,
                 channel.config.protocol,
@@ -540,6 +666,7 @@ impl GatewayEngine {
                             route_mode: decision.mode,
                             sticky_hit: decision.sticky_hit,
                             prefix_key: decision.prefix_key.clone(),
+                            extra_headers: BTreeMap::new(),
                         };
 
                         let traj_session = canonical
@@ -741,6 +868,7 @@ impl GatewayEngine {
                             }
                             let encoded_downstream =
                                 downstream_codec.encode_response(&canonical_resp);
+                            mw_ctx.response = Some(canonical_resp.clone());
 
                             let step = TrajectoryStep {
                                 step_id: step_id.clone(),
@@ -850,7 +978,7 @@ impl GatewayEngine {
             }
         }
 
-        Err(GatewayError::NoAvailableChannel(canonical.model))
+        Err(GatewayError::NoAvailableChannel(canonical.model.clone()))
     }
 }
 

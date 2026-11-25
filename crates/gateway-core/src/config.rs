@@ -1,3 +1,4 @@
+use crate::middleware::mcp_bridge::McpServerConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -22,7 +23,61 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub error_governance: ErrorGovernanceConfig,
     #[serde(default)]
+    pub middleware: MiddlewareConfig,
+    #[serde(default)]
     pub channels: Vec<ChannelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MiddlewareConfig {
+    /// Local ingress rate limit in requests per minute (0 = unlimited).
+    #[serde(default)]
+    pub rpm_limit: u32,
+    #[serde(default)]
+    pub rate_limit_burst: u32,
+    /// Outbound Guardrail: redact API keys/secrets before sending to cloud upstreams.
+    #[serde(default)]
+    pub redact_secrets: bool,
+    /// Outbound Guardrail: redact emails & phone numbers before sending to cloud upstreams.
+    #[serde(default)]
+    pub redact_pii: bool,
+    /// High-risk tool names blocked on upstream tool_use responses.
+    #[serde(default)]
+    pub blocked_tools: Vec<String>,
+    /// Dangerous argument substrings blocked on upstream tool_use responses.
+    #[serde(default)]
+    pub blocked_arg_patterns: Vec<String>,
+    /// Context/Memory middleware: inject workspace facts & episodic snippets.
+    #[serde(default)]
+    pub memory_enabled: bool,
+    #[serde(default)]
+    pub memory_facts: Vec<String>,
+    #[serde(default = "default_memory_max_entries")]
+    pub memory_max_entries: usize,
+    /// Unified MCP Server aggregation bridge definitions.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+fn default_memory_max_entries() -> usize {
+    20
+}
+
+impl Default for MiddlewareConfig {
+    fn default() -> Self {
+        Self {
+            rpm_limit: 0,
+            rate_limit_burst: 0,
+            redact_secrets: false,
+            redact_pii: false,
+            blocked_tools: Vec::new(),
+            blocked_arg_patterns: Vec::new(),
+            memory_enabled: false,
+            memory_facts: Vec::new(),
+            memory_max_entries: default_memory_max_entries(),
+            mcp_servers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

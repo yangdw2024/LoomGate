@@ -413,6 +413,39 @@ def test_9_gemini_thought_signature_sidecar_restoration():
     return f"stripped thoughtSignature transparently restored as '{restored_sig}' on Turn 2"
 
 
+def test_10_onion_middleware_pipeline_and_outbound_guardrail():
+    reset_all()
+    st_mw, _, mw_info = http_json("GET", f"{GATEWAY}/api/middleware")
+    assert st_mw == 200, f"/api/middleware failed: {st_mw} {mw_info}"
+    expected_layers = ["ingress_rate_limit", "guardrail", "context_memory", "mcp_bridge"]
+    assert mw_info.get("layers") == expected_layers, f"unexpected layers: {mw_info}"
+
+    # Send a prompt containing an API key & email -> verify Guardrail redacts before upstream sees it
+    st, headers, _ = http_json(
+        "POST",
+        f"{GATEWAY}/v1/chat/completions",
+        {
+            "model": "gpt-4o-mini",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "My key is sk-ant-secret1234567890 and email is dev@loomgate.dev",
+                }
+            ],
+        },
+        headers={"X-Session-Id": "mw-guardrail-test"},
+    )
+    assert st == 200, f"request failed: {st}"
+    assert get_header(headers, "X-Gateway-Guardrail-Redactions") == "2", f"missing redaction header: {headers}"
+
+    _, _, stats = http_json("GET", f"{UPSTREAMS['openai-primary']}/__admin/stats")
+    sent_msg = stats["last_request"]["messages"][0]["content"]
+    assert "sk-ant-secret" not in sent_msg and "[REDACTED_SECRET]" in sent_msg, f"secret leaked: {sent_msg}"
+    assert "dev@loomgate.dev" not in sent_msg and "[REDACTED_EMAIL]" in sent_msg, f"email leaked: {sent_msg}"
+    return f"layers={expected_layers}, 2 secrets/PII redacted before upstream"
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -424,6 +457,7 @@ if __name__ == "__main__":
         ("7. Stage 2 Trajectory Replay & Fork/Diff", test_7_trajectory_fork_and_diff),
         ("8. Gemini Native & 3-Protocol Interop", test_8_gemini_native_and_three_protocol_interop),
         ("9. Gemini thought_signature Sidecar Restoration", test_9_gemini_thought_signature_sidecar_restoration),
+        ("10. Stage 3 Onion Middleware & Guardrail Redaction", test_10_onion_middleware_pipeline_and_outbound_guardrail),
     ]
     failed = 0
     for name, fn in tests:

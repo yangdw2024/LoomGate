@@ -24,6 +24,13 @@ struct ForkRequest {
     target_model: String,
 }
 
+#[derive(Deserialize)]
+struct McpCallRequest {
+    tool: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -52,6 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:session_id/steps", get(get_session_steps))
         .route("/api/steps/:step_id/fork", post(fork_step))
+        .route("/api/middleware", get(list_middleware))
+        .route("/api/mcp/call", post(call_mcp_tool))
         .route("/v1/messages", post(handle_anthropic))
         .route("/v1/chat/completions", post(handle_openai))
         .route("/v1beta/models/:model_action", post(handle_gemini))
@@ -122,6 +131,32 @@ async fn fork_step(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_middleware(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "layers": state.engine.middleware_layers(),
+        "mcp_tools": state.engine.mcp_bridge().aggregated_tools(),
+    }))
+}
+
+async fn call_mcp_tool(
+    State(state): State<AppState>,
+    Json(req): Json<McpCallRequest>,
+) -> impl IntoResponse {
+    match state
+        .engine
+        .mcp_bridge()
+        .call_tool(&req.tool, req.arguments)
+        .await
+    {
+        Ok(result) => Json(json!({ "ok": true, "result": result })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": e })),
         )
             .into_response(),
     }
@@ -281,6 +316,24 @@ async fn dispatch(
                     if let Ok(hv) = HeaderValue::from_str(&format!("{:?}", tier)) {
                         resp.headers_mut()
                             .insert(HeaderName::from_static("x-gateway-error-tier"), hv);
+                    }
+                    resp
+                }
+                GatewayError::MiddlewareRejected {
+                    status,
+                    error_type,
+                    message,
+                    middleware,
+                } => {
+                    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+                    let mut resp = (
+                        code,
+                        Json(state.engine.format_error(protocol, &error_type, &message)),
+                    )
+                        .into_response();
+                    if let Ok(hv) = HeaderValue::from_str(middleware) {
+                        resp.headers_mut()
+                            .insert(HeaderName::from_static("x-gateway-middleware"), hv);
                     }
                     resp
                 }

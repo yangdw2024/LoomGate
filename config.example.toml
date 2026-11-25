@@ -29,6 +29,18 @@ l2_cooldown_secs = 60
 l3_quarantine_secs = 900
 # L4: 400 semantic / schema / safety refusal -> immediate passthrough, never retry
 
+[middleware]
+# Stage 3 Onion Pipeline: ingress_rate_limit -> guardrail -> context_memory -> mcp_bridge
+rpm_limit = 0
+rate_limit_burst = 0
+redact_secrets = true
+redact_pii = true
+blocked_tools = ["drop_database"]
+blocked_arg_patterns = ["rm -rf /"]
+memory_enabled = false
+memory_facts = []
+memory_max_entries = 20
+
 # --- Upstream Channel Pool ---
 # Replace base_url & api_key with real endpoints, or point to tests/mock_upstream.py for local testing.
 

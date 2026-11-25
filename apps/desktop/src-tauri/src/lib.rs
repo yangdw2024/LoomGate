@@ -440,6 +440,21 @@ async fn dispatch(
             }
             resp
         }
+        Err(GatewayError::MiddlewareRejected {
+            status,
+            error_type,
+            message,
+            middleware,
+        }) => {
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+            let mut resp = (code, Json(engine.format_error(protocol, &error_type, &message)))
+                .into_response();
+            if let Ok(hv) = HeaderValue::from_str(middleware) {
+                resp.headers_mut()
+                    .insert(HeaderName::from_static("x-gateway-middleware"), hv);
+            }
+            resp
+        }
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             Json(engine.format_error(protocol, "api_error", &err.to_string())),
@@ -455,6 +470,7 @@ fn load_config_and_db() -> (GatewayConfig, PathBuf) {
         server: Default::default(),
         routing: Default::default(),
         error_governance: Default::default(),
+        middleware: Default::default(),
         channels: vec![],
     });
     let db_path = std::env::var("GATEWAY_DB_PATH")
