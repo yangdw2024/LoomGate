@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/steps/:step_id/fork", post(fork_step))
         .route("/v1/messages", post(handle_anthropic))
         .route("/v1/chat/completions", post(handle_openai))
+        .route("/v1beta/models/:model_action", post(handle_gemini))
         .with_state(AppState { engine });
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -142,8 +143,47 @@ async fn handle_openai(
     dispatch(state, UpstreamProtocol::OpenAi, headers, payload).await
 }
 
+async fn handle_gemini(
+    State(state): State<AppState>,
+    Path(model_action): Path<String>,
+    headers: HeaderMap,
+    Json(mut payload): Json<Value>,
+) -> Response {
+    let Some((model, action)) = model_action.rsplit_once(':') else {
+        let body = state.engine.format_error(
+            UpstreamProtocol::Gemini,
+            "invalid_request_error",
+            &format!(
+                "invalid Gemini endpoint '{}': expected '<model>:generateContent' or '<model>:streamGenerateContent'",
+                model_action
+            ),
+        );
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    };
+    let stream = match action {
+        "generateContent" => false,
+        "streamGenerateContent" => true,
+        other => {
+            let body = state.engine.format_error(
+                UpstreamProtocol::Gemini,
+                "invalid_request_error",
+                &format!("unsupported Gemini action '{}'", other),
+            );
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("model".into(), json!(model));
+        obj.insert("stream".into(), json!(stream));
+    }
+    dispatch(state, UpstreamProtocol::Gemini, headers, payload).await
+}
+
 fn extract_inbound_token(headers: &HeaderMap) -> Option<&str> {
     if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(k);
+    }
+    if let Some(k) = headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()) {
         return Some(k);
     }
     headers

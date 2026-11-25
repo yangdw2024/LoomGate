@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -118,6 +118,7 @@ async fn run_embedded_proxy(
         .route("/healthz", get(proxy_healthz))
         .route("/v1/messages", post(proxy_anthropic))
         .route("/v1/chat/completions", post(proxy_openai))
+        .route("/v1beta/models/:model_action", post(proxy_gemini))
         .with_state(engine);
 
     match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -165,6 +166,42 @@ async fn proxy_openai(
     Json(payload): Json<Value>,
 ) -> Response {
     dispatch(engine, UpstreamProtocol::OpenAi, headers, payload).await
+}
+
+async fn proxy_gemini(
+    State(engine): State<Arc<GatewayEngine>>,
+    Path(model_action): Path<String>,
+    headers: HeaderMap,
+    Json(mut payload): Json<Value>,
+) -> Response {
+    let Some((model, action)) = model_action.rsplit_once(':') else {
+        let body = engine.format_error(
+            UpstreamProtocol::Gemini,
+            "invalid_request_error",
+            &format!(
+                "invalid Gemini endpoint '{}': expected '<model>:generateContent' or '<model>:streamGenerateContent'",
+                model_action
+            ),
+        );
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    };
+    let stream = match action {
+        "generateContent" => false,
+        "streamGenerateContent" => true,
+        other => {
+            let body = engine.format_error(
+                UpstreamProtocol::Gemini,
+                "invalid_request_error",
+                &format!("unsupported Gemini action '{}'", other),
+            );
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("model".into(), json!(model));
+        obj.insert("stream".into(), json!(stream));
+    }
+    dispatch(engine, UpstreamProtocol::Gemini, headers, payload).await
 }
 
 async fn dispatch(

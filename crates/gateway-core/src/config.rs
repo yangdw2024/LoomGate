@@ -144,6 +144,8 @@ pub enum UpstreamProtocol {
     Anthropic,
     #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
+    #[serde(rename = "gemini", alias = "google_gemini")]
+    Gemini,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

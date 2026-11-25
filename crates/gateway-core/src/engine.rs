@@ -109,6 +109,7 @@ struct StreamEventNormalizer {
     msg_id: String,
     model: String,
     sent_message_start: bool,
+    sent_message_stop: bool,
     open_block: Option<(usize, String)>,
 }
 
@@ -118,6 +119,7 @@ impl StreamEventNormalizer {
             msg_id,
             model,
             sent_message_start: false,
+            sent_message_stop: false,
             open_block: None,
         }
     }
@@ -178,6 +180,10 @@ impl StreamEventNormalizer {
                 });
             }
             CanonicalStreamEvent::MessageStop { stop_reason } => {
+                if self.sent_message_stop {
+                    return out;
+                }
+                self.sent_message_stop = true;
                 self.ensure_message_start(&mut out);
                 if let Some((prev_idx, _)) = self.open_block.take() {
                     out.push(CanonicalStreamEvent::ContentBlockStop { index: prev_idx });
@@ -328,7 +334,11 @@ impl GatewayEngine {
             for (idx, part) in msg.parts.iter_mut().enumerate() {
                 if let ContentPart::Thinking { signature, .. } = part {
                     if signature.is_none() {
-                        if let Some(cached) = self.signatures.get(prefix_key, idx) {
+                        if let Some(cached) = self
+                            .signatures
+                            .get(prefix_key, idx)
+                            .or_else(|| self.signatures.get(prefix_key, 0))
+                        {
                             *signature = Some(cached);
                         }
                     }
@@ -357,6 +367,7 @@ impl GatewayEngine {
 
         let protocol = match original.protocol.as_str() {
             "openai" => UpstreamProtocol::OpenAi,
+            "gemini" => UpstreamProtocol::Gemini,
             _ => UpstreamProtocol::Anthropic,
         };
 
@@ -451,7 +462,12 @@ impl GatewayEngine {
             let upstream_model = channel.config.resolve_upstream_model(&decision.actual_model);
             let encoded_body =
                 upstream_codec.encode_request(&canonical, &upstream_model, same_protocol)?;
-            let endpoint = upstream_endpoint(&channel.config.base_url, channel.config.protocol);
+            let endpoint = upstream_endpoint(
+                &channel.config.base_url,
+                channel.config.protocol,
+                &upstream_model,
+                canonical.stream,
+            );
 
             let mut l1_attempt = 0u32;
             loop {
@@ -466,6 +482,9 @@ impl GatewayEngine {
                         .header("X-Gateway-Prefix-Key", &decision.prefix_key),
                     UpstreamProtocol::OpenAi => req_builder
                         .bearer_auth(&channel.config.api_key)
+                        .header("X-Gateway-Prefix-Key", &decision.prefix_key),
+                    UpstreamProtocol::Gemini => req_builder
+                        .header("x-goog-api-key", &channel.config.api_key)
                         .header("X-Gateway-Prefix-Key", &decision.prefix_key),
                 };
 
@@ -498,6 +517,7 @@ impl GatewayEngine {
                         let proto_str = match downstream_protocol {
                             UpstreamProtocol::Anthropic => "anthropic",
                             UpstreamProtocol::OpenAi => "openai",
+                            UpstreamProtocol::Gemini => "gemini",
                         }
                         .to_string();
                         let mode_str = match decision.mode {
@@ -601,8 +621,14 @@ impl GatewayEngine {
                                                         let raw_events = up_codec.decode_sse_frame(frame.event.as_deref(), &frame.data);
                                                         for raw_ev in raw_events {
                                                             for ev in normalizer.normalize(raw_ev) {
-                                                                if let CanonicalStreamEvent::TextDelta { ref text, .. } = ev {
-                                                                    acc_text.push_str(text);
+                                                                match &ev {
+                                                                    CanonicalStreamEvent::TextDelta { text, .. } => {
+                                                                        acc_text.push_str(text);
+                                                                    }
+                                                                    CanonicalStreamEvent::SignatureDelta { index, signature } => {
+                                                                        bg_signatures.put(&prefix_key, *index, signature.clone());
+                                                                    }
+                                                                    _ => {}
                                                                 }
                                                                 for out_sse in down_codec.encode_sse_event(&ev) {
                                                                     bg_metrics.add_output_bytes(out_sse.len() as u64);
@@ -792,11 +818,26 @@ impl GatewayEngine {
     }
 }
 
-fn upstream_endpoint(base_url: &str, protocol: UpstreamProtocol) -> String {
+fn upstream_endpoint(
+    base_url: &str,
+    protocol: UpstreamProtocol,
+    upstream_model: &str,
+    stream: bool,
+) -> String {
     let trimmed = base_url.trim_end_matches('/');
     match protocol {
         UpstreamProtocol::Anthropic => format!("{}/v1/messages", trimmed),
         UpstreamProtocol::OpenAi => format!("{}/v1/chat/completions", trimmed),
+        UpstreamProtocol::Gemini => {
+            if stream {
+                format!(
+                    "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                    trimmed, upstream_model
+                )
+            } else {
+                format!("{}/v1beta/models/{}:generateContent", trimmed, upstream_model)
+            }
+        }
     }
 }
 

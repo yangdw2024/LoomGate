@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod gemini;
 pub mod openai;
 
 use crate::config::UpstreamProtocol;
@@ -41,5 +42,6 @@ pub fn codec_for(protocol: UpstreamProtocol) -> Box<dyn ProtocolCodec> {
     match protocol {
         UpstreamProtocol::Anthropic => Box::new(anthropic::AnthropicCodec),
         UpstreamProtocol::OpenAi => Box::new(openai::OpenAiCodec),
+        UpstreamProtocol::Gemini => Box::new(gemini::GeminiCodec),
     }
 }

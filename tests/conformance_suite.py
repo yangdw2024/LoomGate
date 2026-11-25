@@ -19,6 +19,7 @@ UPSTREAMS = {
     "anthropic-primary": "http://127.0.0.1:18081",
     "anthropic-backup": "http://127.0.0.1:18082",
     "openai-primary": "http://127.0.0.1:18083",
+    "gemini-primary": "http://127.0.0.1:18084",
 }
 
 
@@ -258,6 +259,7 @@ def test_6_cross_protocol_streaming_frames_and_utf8():
     assert "content_block_delta" in events, f"missing content_block_delta in {events}"
     assert "content_block_stop" in events, f"missing content_block_stop in {events}"
     assert "message_stop" in events, f"missing message_stop in {events}"
+    assert events.count("message_stop") == 1, f"duplicate message_stop detected in {events}"
     assert "跨协议中文" in raw_sse
     return f"events={events[:4]}...{events[-2:]}, CJK UTF-8 intact"
 
@@ -294,6 +296,123 @@ def test_7_trajectory_fork_and_diff():
     return f"forked {step_id} -> {diff['forked']['step_id']} (gpt-4o), 2 steps persisted"
 
 
+def test_8_gemini_native_and_three_protocol_interop():
+    reset_all()
+
+    # 8a. Native Gemini -> Gemini upstream
+    st1, h1, b1 = http_json(
+        "POST",
+        f"{GATEWAY}/v1beta/models/gemini-2.5-pro:generateContent",
+        {
+            "contents": [{"role": "user", "parts": [{"text": "Hello Gemini native"}]}],
+            "generationConfig": {"maxOutputTokens": 256},
+        },
+    )
+    assert st1 == 200, f"native gemini failed: {st1} {b1}"
+    assert get_header(h1, "X-Gateway-Actual-Model") == "gemini-2.5-pro"
+    parts1 = b1["candidates"][0]["content"]["parts"]
+    assert any("Gemini reply from gemini-primary" in p.get("text", "") for p in parts1), f"unexpected gemini body: {b1}"
+
+    # 8b. Gemini client -> OpenAI upstream (cross-protocol non-streaming)
+    st2, h2, b2 = http_json(
+        "POST",
+        f"{GATEWAY}/v1beta/models/gpt-4o-mini:generateContent",
+        {
+            "contents": [{"role": "user", "parts": [{"text": "Gemini to OpenAI"}]}],
+        },
+    )
+    assert st2 == 200, f"gemini->openai failed: {st2} {b2}"
+    assert get_header(h2, "X-Gateway-Actual-Model") == "gpt-4o-mini"
+    assert "candidates" in b2 and b2["candidates"][0]["finishReason"] == "STOP"
+    assert "OpenAI reply from openai-primary" in b2["candidates"][0]["content"]["parts"][0]["text"]
+
+    # 8c. OpenAI client -> Gemini upstream (cross-protocol non-streaming)
+    st3, h3, b3 = http_json(
+        "POST",
+        f"{GATEWAY}/v1/chat/completions",
+        {
+            "model": "gemini-2.5-pro",
+            "stream": False,
+            "messages": [{"role": "user", "content": "OpenAI to Gemini"}],
+        },
+    )
+    assert st3 == 200, f"openai->gemini failed: {st3} {b3}"
+    assert get_header(h3, "X-Gateway-Actual-Model") == "gemini-2.5-pro"
+    assert b3.get("object") == "chat.completion"
+    assert "Gemini reply from gemini-primary" in b3["choices"][0]["message"]["content"]
+
+    # 8d. Anthropic client -> Gemini upstream (cross-protocol SSE streaming + CJK UTF-8)
+    conn = http.client.HTTPConnection("127.0.0.1", 8787, timeout=10)
+    conn.request(
+        "POST",
+        "/v1/messages",
+        body=json.dumps(
+            {
+                "model": "gemini-2.5-pro",
+                "stream": True,
+                "messages": [{"role": "user", "content": "Anthropic stream to Gemini"}],
+            }
+        ),
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    assert resp.status == 200, f"anthropic->gemini stream failed: {resp.status}"
+    raw_sse = resp.read().decode("utf-8")
+    conn.close()
+    assert "\ufffd" not in raw_sse
+    events = [line.split("event:", 1)[1].strip() for line in raw_sse.splitlines() if line.startswith("event:")]
+    assert "message_start" in events and "content_block_start" in events and "message_stop" in events
+    assert "Gemini中文分片" in raw_sse
+
+    return "Gemini native + Gemini<->OpenAI + Anthropic->Gemini SSE all green"
+
+
+def test_9_gemini_thought_signature_sidecar_restoration():
+    reset_all()
+    sess_id = f"gem-sig-{int(time.time())}"
+
+    # Turn 1: Gemini upstream returns thoughtSignature = sig_gemini_1, cached by GatewayEngine
+    st1, _, b1 = http_json(
+        "POST",
+        f"{GATEWAY}/v1beta/models/gemini-2.5-pro:generateContent",
+        {
+            "contents": [{"role": "user", "parts": [{"text": "Turn 1 reasoning"}]}],
+            "generationConfig": {"thinkingConfig": {"includeThoughts": True, "thinkingBudget": 1024}},
+        },
+        headers={"X-Session-Id": sess_id},
+    )
+    assert st1 == 200, f"turn 1 failed: {st1} {b1}"
+    turn1_sig = b1["candidates"][0]["content"]["parts"][0].get("thoughtSignature")
+    assert turn1_sig == "sig_gemini_1", f"expected sig_gemini_1, got {turn1_sig}"
+
+    # Turn 2: Client strips thoughtSignature from history; gateway must hydrate it from SignatureCache
+    st2, _, b2 = http_json(
+        "POST",
+        f"{GATEWAY}/v1beta/models/gemini-2.5-pro:generateContent",
+        {
+            "contents": [
+                {"role": "user", "parts": [{"text": "Turn 1 reasoning"}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {"thought": True, "text": "Gemini internal reasoning"},
+                        {"text": "Gemini reply from gemini-primary (gemini-2.5-pro)"},
+                    ],
+                },
+                {"role": "user", "parts": [{"text": "Turn 2 follow-up"}]},
+            ],
+        },
+        headers={"X-Session-Id": sess_id},
+    )
+    assert st2 == 200, f"turn 2 failed: {st2} {b2}"
+
+    _, _, stats = http_json("GET", f"{UPSTREAMS['gemini-primary']}/__admin/stats")
+    last_req = stats.get("last_request") or {}
+    restored_sig = last_req["contents"][1]["parts"][0].get("thoughtSignature")
+    assert restored_sig == "sig_gemini_1", f"expected hydrated sig_gemini_1, got {restored_sig} in {last_req}"
+    return f"stripped thoughtSignature transparently restored as '{restored_sig}' on Turn 2"
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -303,6 +422,8 @@ if __name__ == "__main__":
         ("5. Cross-Protocol Non-Streaming IR Body", test_5_cross_protocol_non_streaming_response),
         ("6. Cross-Protocol SSE Framing & UTF-8", test_6_cross_protocol_streaming_frames_and_utf8),
         ("7. Stage 2 Trajectory Replay & Fork/Diff", test_7_trajectory_fork_and_diff),
+        ("8. Gemini Native & 3-Protocol Interop", test_8_gemini_native_and_three_protocol_interop),
+        ("9. Gemini thought_signature Sidecar Restoration", test_9_gemini_thought_signature_sidecar_restoration),
     ]
     failed = 0
     for name, fn in tests:

@@ -29,6 +29,7 @@ class ChannelState:
         self.aborted_streams = 0
         self.completed_streams = 0
         self.fault_queue: list[dict] = []
+        self.last_request: dict | None = None
 
     def reset(self):
         with self.lock:
@@ -38,6 +39,7 @@ class ChannelState:
             self.aborted_streams = 0
             self.completed_streams = 0
             self.fault_queue.clear()
+            self.last_request = None
 
     def stats(self) -> dict:
         with self.lock:
@@ -49,6 +51,7 @@ class ChannelState:
                 "aborted_streams": self.aborted_streams,
                 "completed_streams": self.completed_streams,
                 "pending_faults": len(self.fault_queue),
+                "last_request": self.last_request,
             }
 
 
@@ -101,6 +104,7 @@ def make_handler(state: ChannelState):
 
             with state.lock:
                 state.total_requests += 1
+                state.last_request = payload
                 fault = state.fault_queue.pop(0) if state.fault_queue else None
 
             if fault:
@@ -121,8 +125,17 @@ def make_handler(state: ChannelState):
                 else:
                     state.seen_prefixes.add(prefix_key)
 
-            model = payload.get("model", "unknown")
-            stream = bool(payload.get("stream", False))
+            if state.protocol == "gemini":
+                path_no_query = self.path.split("?", 1)[0]
+                model_action = path_no_query.rsplit("/", 1)[-1]
+                if ":" in model_action:
+                    model, action = model_action.rsplit(":", 1)
+                else:
+                    model, action = "gemini-2.5-pro", "generateContent"
+                stream = action == "streamGenerateContent"
+            else:
+                model = payload.get("model", "unknown")
+                stream = bool(payload.get("stream", False))
             slow_chunks = int(payload.get("mock_slow_chunks", 0))
 
             if not stream:
@@ -143,6 +156,39 @@ def make_handler(state: ChannelState):
                                 "input_tokens": 100 if cache_hit else 1000,
                                 "cache_read_input_tokens": 900 if cache_hit else 0,
                                 "output_tokens": 42,
+                            },
+                        },
+                    )
+                elif state.protocol == "gemini":
+                    self._send_json(
+                        200,
+                        {
+                            "responseId": f"gem_{state.channel_id}_{state.total_requests}",
+                            "modelVersion": model,
+                            "candidates": [
+                                {
+                                    "index": 0,
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [
+                                            {
+                                                "thought": True,
+                                                "text": "Gemini internal reasoning",
+                                                "thoughtSignature": f"sig_gemini_{state.total_requests}",
+                                            },
+                                            {
+                                                "text": f"Gemini reply from {state.channel_id} ({model})",
+                                            },
+                                        ],
+                                    },
+                                    "finishReason": "STOP",
+                                }
+                            ],
+                            "usageMetadata": {
+                                "promptTokenCount": 1000,
+                                "cachedContentTokenCount": 900 if cache_hit else 0,
+                                "candidatesTokenCount": 38,
+                                "totalTokenCount": 1038,
                             },
                         },
                     )
@@ -225,6 +271,55 @@ def make_handler(state: ChannelState):
                         {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
                     )
                     self._write_sse("message_stop", {"type": "message_stop"})
+                elif state.protocol == "gemini":
+                    self._write_sse(
+                        None,
+                        {
+                            "candidates": [
+                                {
+                                    "index": 0,
+                                    "content": {
+                                        "role": "model",
+                                        "parts": [
+                                            {
+                                                "thought": True,
+                                                "text": "思考过程",
+                                                "thoughtSignature": f"sig_gemini_stream_{state.total_requests}",
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        },
+                    )
+                    for i in range(chunks):
+                        time.sleep(delay)
+                        self._write_sse(
+                            None,
+                            {
+                                "candidates": [
+                                    {
+                                        "index": 0,
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [{"text": f"Gemini中文分片-{i} "}],
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                    self._write_sse(
+                        None,
+                        {
+                            "candidates": [{"index": 0, "finishReason": "STOP"}],
+                            "usageMetadata": {
+                                "promptTokenCount": 1000,
+                                "cachedContentTokenCount": 900 if cache_hit else 0,
+                                "candidatesTokenCount": chunks * 5,
+                                "totalTokenCount": 1000 + chunks * 5,
+                            },
+                        },
+                    )
                 else:
                     for i in range(chunks):
                         time.sleep(delay)
@@ -280,6 +375,7 @@ def start_mock_cluster():
         ("anthropic-primary", "anthropic", 18081),
         ("anthropic-backup", "anthropic", 18082),
         ("openai-primary", "openai", 18083),
+        ("gemini-primary", "gemini", 18084),
     ]
     servers = []
     for cid, proto, port in specs:
