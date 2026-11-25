@@ -11,10 +11,18 @@ pub mod signature_cache;
 pub mod sse_fsm;
 pub mod trajectory;
 
-pub use cli_takeover::{CliIntegrationStatus, CliTakeoverManager, CliTool, TakeoverError};
+pub use cli_takeover::{
+    AtomicTakeoverSpec, CliIntegrationStatus, CliTakeoverManager, CliTool, ClientProfile,
+    ClientProfileStatus, ConfigFormat, IntegrationKind, SetupWizardSpec, TakeoverError,
+};
 pub use cloud_sync::{CloudSessionStatus, CloudSyncClient, SanitizedTelemetryUpload};
-pub use config::{ChannelConfig, GatewayConfig, MiddlewareConfig, RouteMode, UpstreamProtocol};
-pub use engine::{GatewayEngine, GatewayError, GatewayResponse, ResponseMetadata};
+pub use config::{
+    normalize_base_url, ChannelConfig, GatewayConfig, MiddlewareConfig, RouteMode, ServerConfig,
+    UpstreamProtocol,
+};
+pub use engine::{
+    AuthSettings, ChannelTestResult, GatewayEngine, GatewayError, GatewayResponse, ResponseMetadata,
+};
 pub use error_gov::ErrorTier;
 pub use ir::{CanonicalRequest, CanonicalStreamEvent, CanonicalUsage};
 pub use middleware::{

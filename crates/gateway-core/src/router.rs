@@ -58,7 +58,27 @@ impl ChannelRuntime {
     }
 
     pub fn is_available(&self) -> bool {
-        self.health() == ChannelHealth::Healthy
+        self.config.enabled && self.health() == ChannelHealth::Healthy
+    }
+
+    pub fn cooldown_remaining_secs(&self) -> u64 {
+        let now = self.now_ms();
+        let until = self.cooldown_until_ms.load(Ordering::Relaxed);
+        if until > now {
+            (until - now).div_ceil(1000)
+        } else {
+            0
+        }
+    }
+
+    pub fn quarantine_remaining_secs(&self) -> u64 {
+        let now = self.now_ms();
+        let until = self.quarantined_until_ms.load(Ordering::Relaxed);
+        if until > now {
+            (until - now).div_ceil(1000)
+        } else {
+            0
+        }
     }
 
     pub fn mark_cooldown(&self, duration: Duration) {
@@ -110,7 +130,16 @@ impl ChannelRuntime {
         ChannelSnapshot {
             id: self.config.id.clone(),
             protocol: format!("{:?}", self.config.protocol).to_lowercase(),
+            base_url: self.config.base_url.clone(),
+            enabled: self.config.enabled,
+            weight: self.config.weight,
+            models: self.config.models.clone(),
+            proxy_url: self.config.proxy_url.clone(),
+            fallback_models: self.config.fallback_models.clone(),
+            quota_endpoint: self.config.quota_endpoint.clone(),
             health: self.health(),
+            cooldown_remaining_secs: self.cooldown_remaining_secs(),
+            quarantine_remaining_secs: self.quarantine_remaining_secs(),
             inflight: self.inflight.load(Ordering::Relaxed),
             ewma_ttft_ms,
             total_requests: self.total_requests.load(Ordering::Relaxed),
@@ -122,7 +151,16 @@ impl ChannelRuntime {
 pub struct ChannelSnapshot {
     pub id: String,
     pub protocol: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub weight: u32,
+    pub models: Vec<String>,
+    pub proxy_url: Option<String>,
+    pub fallback_models: Vec<String>,
+    pub quota_endpoint: Option<String>,
     pub health: ChannelHealth,
+    pub cooldown_remaining_secs: u64,
+    pub quarantine_remaining_secs: u64,
     pub inflight: usize,
     pub ewma_ttft_ms: Option<u64>,
     pub total_requests: u64,
@@ -170,7 +208,8 @@ impl StickyP2cRouter {
     pub fn merge_remote_channels(&self, remote: Vec<ChannelConfig>) -> usize {
         let mut guard = self.channels.write().unwrap_or_else(|e| e.into_inner());
         let mut merged = 0usize;
-        for cfg in remote {
+        for mut cfg in remote {
+            cfg.normalize();
             let rt = Arc::new(ChannelRuntime::new(cfg.clone(), self.epoch));
             if let Some(slot) = guard.iter_mut().find(|c| c.config.id == cfg.id) {
                 *slot = rt;
@@ -180,6 +219,63 @@ impl StickyP2cRouter {
             merged += 1;
         }
         merged
+    }
+
+    pub fn upsert_channel(&self, mut cfg: ChannelConfig) -> ChannelSnapshot {
+        cfg.normalize();
+        let rt = Arc::new(ChannelRuntime::new(cfg.clone(), self.epoch));
+        let snap = rt.snapshot();
+        let mut guard = self.channels.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = guard.iter_mut().find(|c| c.config.id == cfg.id) {
+            *slot = rt;
+        } else {
+            guard.push(rt);
+        }
+        snap
+    }
+
+    pub fn delete_channel(&self, id: &str) -> bool {
+        let mut guard = self.channels.write().unwrap_or_else(|e| e.into_inner());
+        let before = guard.len();
+        guard.retain(|c| c.config.id != id);
+        if guard.len() < before {
+            self.sticky_map.retain(|_, v| v.channel_id != id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_channel_enabled(&self, id: &str, enabled: bool) -> Option<ChannelSnapshot> {
+        let mut guard = self.channels.write().unwrap_or_else(|e| e.into_inner());
+        let slot = guard.iter_mut().find(|c| c.config.id == id)?;
+        let mut next_cfg = slot.config.clone();
+        next_cfg.enabled = enabled;
+        let rt = Arc::new(ChannelRuntime::new(next_cfg, self.epoch));
+        let snap = rt.snapshot();
+        *slot = rt;
+        if !enabled {
+            self.sticky_map.retain(|_, v| v.channel_id != id);
+        }
+        Some(snap)
+    }
+
+    pub fn get_channel(&self, id: &str) -> Option<Arc<ChannelRuntime>> {
+        self.channels
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|c| c.config.id == id)
+            .cloned()
+    }
+
+    pub fn channel_configs(&self) -> Vec<ChannelConfig> {
+        self.channels
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|c| c.config.clone())
+            .collect()
     }
 
     pub fn channel_count(&self) -> usize {
@@ -248,14 +344,39 @@ impl StickyP2cRouter {
             }
         }
 
-        let candidates: Vec<&Arc<ChannelRuntime>> = channels_guard
+        let mut resolved_model = actual_model.clone();
+        let mut candidates: Vec<&Arc<ChannelRuntime>> = channels_guard
             .iter()
             .filter(|c| {
                 c.is_available()
-                    && c.config.supports_model(&actual_model)
+                    && c.config.supports_model(&resolved_model)
                     && !excluded_ids.contains(&c.config.id)
             })
             .collect();
+
+        // Explicit fallback_models chain (ONLY active in StageAware mode — Lock mode NEVER silently downgrades).
+        if candidates.is_empty() && mode == RouteMode::StageAware {
+            let fallback_list: Vec<String> = channels_guard
+                .iter()
+                .filter(|c| c.config.supports_model(&actual_model))
+                .flat_map(|c| c.config.fallback_models.iter().cloned())
+                .collect();
+            for fb_model in fallback_list {
+                let fb_candidates: Vec<&Arc<ChannelRuntime>> = channels_guard
+                    .iter()
+                    .filter(|c| {
+                        c.is_available()
+                            && c.config.supports_model(&fb_model)
+                            && !excluded_ids.contains(&c.config.id)
+                    })
+                    .collect();
+                if !fb_candidates.is_empty() {
+                    resolved_model = fb_model;
+                    candidates = fb_candidates;
+                    break;
+                }
+            }
+        }
 
         if candidates.is_empty() {
             return None;
@@ -273,8 +394,9 @@ impl StickyP2cRouter {
             }
         };
 
+        let resolved_sticky_key = format!("{}::{}", resolved_model, prefix_key);
         self.sticky_map.insert(
-            sticky_key,
+            resolved_sticky_key,
             StickyBinding {
                 channel_id: chosen.config.id.clone(),
                 expires_at: now + Duration::from_secs(self.config.sticky_ttl_secs),
@@ -284,7 +406,7 @@ impl StickyP2cRouter {
 
         Some(RouteDecision {
             channel: Arc::clone(chosen),
-            actual_model,
+            actual_model: resolved_model,
             mode,
             sticky_hit: false,
             prefix_key,
@@ -349,8 +471,12 @@ mod tests {
                 base_url: "http://localhost:1".into(),
                 api_key: "k1".into(),
                 weight: 100,
+                enabled: true,
                 models: vec!["claude-sonnet-4-20250514".into()],
                 model_map: Default::default(),
+                proxy_url: None,
+                fallback_models: vec![],
+                quota_endpoint: None,
             },
             ChannelConfig {
                 id: "ch-b".into(),
@@ -358,8 +484,12 @@ mod tests {
                 base_url: "http://localhost:2".into(),
                 api_key: "k2".into(),
                 weight: 100,
+                enabled: true,
                 models: vec!["claude-sonnet-4-20250514".into()],
                 model_map: Default::default(),
+                proxy_url: None,
+                fallback_models: vec![],
+                quota_endpoint: None,
             },
         ];
         let router = StickyP2cRouter::new(channels, RoutingConfig::default());
@@ -376,6 +506,7 @@ mod tests {
         }
 
         d1.channel.mark_cooldown(Duration::from_secs(60));
+        assert!(d1.channel.cooldown_remaining_secs() > 0);
         let d_failover = router.select_channel(&req, None, &[]).unwrap();
         assert!(!d_failover.sticky_hit);
         assert_ne!(d_failover.channel.config.id, pinned_id);

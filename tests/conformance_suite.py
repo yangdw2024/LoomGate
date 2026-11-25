@@ -527,6 +527,128 @@ def test_11_edge_cloud_hybrid_login_billing_and_sanitized_telemetry():
         http_json("POST", f"{GATEWAY}/api/cloud/logout")
 
 
+def test_12_claude_cli_preflight_count_tokens():
+    reset_all()
+    st, _, body = http_json(
+        "POST",
+        f"{GATEWAY}/v1/messages/count_tokens",
+        {
+            "model": "claude-sonnet-4-20250514",
+            "system": "You are LoomGate coding assistant.",
+            "messages": [{"role": "user", "content": "Count tokens for this Claude CLI preflight check."}],
+        },
+    )
+    assert st == 200, f"count_tokens failed: {st} {body}"
+    assert isinstance(body.get("input_tokens"), int) and body["input_tokens"] > 0, f"invalid count_tokens: {body}"
+    return f"input_tokens={body['input_tokens']}"
+
+
+def test_13_declarative_client_registry_and_live_channel_crud():
+    reset_all()
+    # 13a. Client Profile Registry (3 atomic + 5 setup wizards)
+    st_c, _, clients_body = http_json("GET", f"{GATEWAY}/api/clients")
+    assert st_c == 200, f"/api/clients failed: {st_c} {clients_body}"
+    ids = {p["id"] for p in clients_body.get("profiles", [])}
+    required = {
+        "claude_code",
+        "codex",
+        "gemini_cli",
+        "cursor",
+        "cline_roo",
+        "cherry_studio",
+        "trae",
+        "generic_sdk",
+    }
+    assert required.issubset(ids), f"missing client profiles: {required - ids}"
+
+    # 13b. Live Channel Upsert with redundant /v1/ -> auto-normalized + Test Connection + Toggle + Delete
+    draft = {
+        "id": "dynamic-test-ch",
+        "protocol": "openai",
+        "base_url": "http://127.0.0.1:18083/v1/",
+        "api_key": "sk-dyn-test",
+        "weight": 100,
+        "enabled": True,
+        "models": ["gpt-4o-dyn"],
+        "fallback_models": ["gpt-4o-mini"],
+        "quota_endpoint": "http://127.0.0.1:18083/__admin/stats",
+    }
+    st_up, _, up_body = http_json("POST", f"{GATEWAY}/api/channels", draft)
+    assert st_up == 200 and up_body["ok"], f"upsert failed: {st_up} {up_body}"
+    assert up_body["channel"]["base_url"] == "http://127.0.0.1:18083", f"base_url not normalized: {up_body}"
+
+    st_probe, _, probe = http_json("POST", f"{GATEWAY}/api/channels/test", draft)
+    assert st_probe == 200 and probe["ok"], f"channel probe failed: {st_probe} {probe}"
+    assert probe.get("quota_info") is not None, f"expected quota_info from quota_endpoint: {probe}"
+
+    st_tog, _, tog = http_json("POST", f"{GATEWAY}/api/channels/dynamic-test-ch/toggle", {"enabled": False})
+    assert st_tog == 200 and tog["channel"]["enabled"] is False
+
+    st_del, _, del_body = http_json("DELETE", f"{GATEWAY}/api/channels/dynamic-test-ch")
+    assert st_del == 200 and del_body["deleted"] is True
+
+    return f"8 built-in profiles verified; base_url normalized; probe={probe['latency_ms']}ms with quota_info"
+
+
+def test_14_split_api_key_and_admin_password_auth():
+    reset_all()
+    api_secret = "lg_api_split_test"
+    admin_secret = "lg_admin_split_test"
+
+    st_set, _, set_body = http_json(
+        "POST",
+        f"{GATEWAY}/api/auth/settings",
+        {"api_key": api_secret, "admin_password": admin_secret},
+    )
+    assert st_set == 200 and set_body["ok"], f"failed to set split auth: {st_set} {set_body}"
+
+    try:
+        # Inference rejects missing key and admin password; accepts api_key
+        st_no_key, _, _ = http_json(
+            "POST",
+            f"{GATEWAY}/v1/messages/count_tokens",
+            {"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert st_no_key == 401, f"expected 401 without api_key, got {st_no_key}"
+
+        st_wrong_key, _, _ = http_json(
+            "POST",
+            f"{GATEWAY}/v1/messages/count_tokens",
+            {"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"x-api-key": admin_secret},
+        )
+        assert st_wrong_key == 401, f"admin_password must NOT unlock inference: got {st_wrong_key}"
+
+        st_ok_key, _, _ = http_json(
+            "POST",
+            f"{GATEWAY}/v1/messages/count_tokens",
+            {"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"x-api-key": api_secret},
+        )
+        assert st_ok_key == 200, f"expected 200 with api_key, got {st_ok_key}"
+
+        # Admin rejects api_key; accepts admin_password
+        st_adm_deny, _, _ = http_json(
+            "GET", f"{GATEWAY}/api/channels", headers={"Authorization": f"Bearer {api_secret}"}
+        )
+        assert st_adm_deny == 401, f"api_key must NOT unlock /api/* admin: got {st_adm_deny}"
+
+        st_adm_ok, _, _ = http_json(
+            "GET", f"{GATEWAY}/api/channels", headers={"x-admin-password": admin_secret}
+        )
+        assert st_adm_ok == 200, f"expected 200 with admin_password, got {st_adm_ok}"
+
+        return "api_key (/v1/*) & admin_password (/api/*) strictly isolated"
+    finally:
+        # Always restore passwordless local mode so subsequent runs stay clean
+        http_json(
+            "POST",
+            f"{GATEWAY}/api/auth/settings",
+            {"api_key": None, "admin_password": None},
+            headers={"x-admin-password": admin_secret},
+        )
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -540,6 +662,9 @@ if __name__ == "__main__":
         ("9. Gemini thought_signature Sidecar Restoration", test_9_gemini_thought_signature_sidecar_restoration),
         ("10. Stage 3 Onion Middleware & Guardrail Redaction", test_10_onion_middleware_pipeline_and_outbound_guardrail),
         ("11. Stage 3 Edge-Cloud Sync, 2PC Billing & Sanitized Telemetry", test_11_edge_cloud_hybrid_login_billing_and_sanitized_telemetry),
+        ("12. v0.4.0 Claude CLI Preflight count_tokens", test_12_claude_cli_preflight_count_tokens),
+        ("13. v0.4.0 Declarative Client Registry & Live Channel CRUD/Probe", test_13_declarative_client_registry_and_live_channel_crud),
+        ("14. v0.4.0 Split Auth (api_key vs admin_password)", test_14_split_api_key_and_admin_password_auth),
     ]
     failed = 0
     for name, fn in tests:

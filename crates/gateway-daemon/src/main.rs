@@ -1,22 +1,26 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use gateway_core::{
-    GatewayConfig, GatewayEngine, GatewayError, GatewayResponse, RouteMode, UpstreamProtocol,
+    AuthSettings, ChannelConfig, CliTakeoverManager, GatewayConfig, GatewayEngine, GatewayError,
+    GatewayResponse, RouteMode, UpstreamProtocol,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 
 #[derive(Clone)]
 struct AppState {
     engine: Arc<GatewayEngine>,
+    takeover: Arc<CliTakeoverManager>,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +42,57 @@ struct CloudLoginRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct ToggleChannelRequest {
+    enabled: bool,
+}
+
+fn extract_admin_credential(headers: &HeaderMap) -> Option<&str> {
+    if let Some(p) = headers.get("x-admin-password").and_then(|v| v.to_str().ok()) {
+        return Some(p);
+    }
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+}
+
+async fn require_admin_auth(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !state
+        .engine
+        .verify_admin_auth(extract_admin_credential(req.headers()))
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "type": "admin_authentication_error",
+                    "message": "invalid or missing admin password (supply x-admin-password or Bearer token)"
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn resolve_persist_path(loaded_config_path: &str) -> PathBuf {
+    if let Ok(explicit) = std::env::var("GATEWAY_PERSIST_CONFIG") {
+        if !explicit.trim().is_empty() {
+            return PathBuf::from(explicit);
+        }
+    }
+    let loaded = PathBuf::from(loaded_config_path);
+    match loaded.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("config.local.toml"),
+        _ => PathBuf::from("config.local.toml"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -57,11 +112,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = GatewayConfig::from_file(&config_path)?;
     let bind_addr = config.server.bind_addr.clone();
+    let gateway_url = format!("http://{}", bind_addr);
     let engine = Arc::new(GatewayEngine::new_with_sqlite(config, &db_path)?);
+    engine.set_persist_config_path(resolve_persist_path(&config_path));
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/metrics/channels", get(channel_metrics))
+    let takeover = Arc::new(
+        CliTakeoverManager::new(gateway_url)
+            .unwrap_or_else(|_| CliTakeoverManager::with_home_dir(PathBuf::from("."), "http://127.0.0.1:8787")),
+    );
+    let state = AppState { engine, takeover };
+
+    let admin_routes = Router::new()
         .route("/__admin/reset", post(admin_reset))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:session_id/steps", get(get_session_steps))
@@ -72,13 +133,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/cloud/login", post(cloud_login))
         .route("/api/cloud/sync", post(cloud_sync))
         .route("/api/cloud/logout", post(cloud_logout))
+        .route("/api/channels", get(list_channels).post(upsert_channel))
+        .route("/api/channels/test", post(test_channel))
+        .route("/api/channels/:id", delete(delete_channel))
+        .route("/api/channels/:id/toggle", post(toggle_channel))
+        .route("/api/clients", get(list_clients))
+        .route("/api/auth/settings", get(get_auth_settings).post(set_auth_settings))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_auth,
+        ));
+
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics/channels", get(channel_metrics))
         .route("/v1/messages", post(handle_anthropic))
+        .route("/v1/messages/count_tokens", post(handle_anthropic_count_tokens))
         .route("/v1/chat/completions", post(handle_openai))
         .route("/v1beta/models/:model_action", post(handle_gemini))
-        .with_state(AppState { engine });
+        .merge(admin_routes)
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!(bind_addr = %bind_addr, db = %db_path, "edge-gateway local daemon listening (v0.2.1)");
+    info!(bind_addr = %bind_addr, db = %db_path, "LoomGate local daemon listening (v0.4.0)");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -88,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
-        "version": "0.2.1",
+        "version": "0.4.0",
         "kernel": "gateway-core",
         "route_mode": format!("{:?}", state.engine.active_route_mode()).to_lowercase()
     }))
@@ -101,6 +178,92 @@ async fn channel_metrics(State(state): State<AppState>) -> impl IntoResponse {
 async fn admin_reset(State(state): State<AppState>) -> impl IntoResponse {
     state.engine.reset_runtime_state();
     Json(json!({ "ok": true }))
+}
+
+async fn list_channels(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "snapshots": state.engine.channel_snapshots(),
+        "configs": state.engine.list_channel_configs(),
+    }))
+}
+
+async fn upsert_channel(
+    State(state): State<AppState>,
+    Json(cfg): Json<ChannelConfig>,
+) -> impl IntoResponse {
+    match state.engine.upsert_channel(cfg) {
+        Ok(snap) => Json(json!({ "ok": true, "channel": snap })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_channel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.engine.delete_channel(&id) {
+        Ok(deleted) => Json(json!({ "ok": true, "deleted": deleted })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn toggle_channel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ToggleChannelRequest>,
+) -> impl IntoResponse {
+    match state.engine.set_channel_enabled(&id, req.enabled) {
+        Ok(snap) => Json(json!({ "ok": true, "channel": snap })).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn test_channel(
+    State(state): State<AppState>,
+    Json(cfg): Json<ChannelConfig>,
+) -> impl IntoResponse {
+    let result = state.engine.test_channel_connection(cfg).await;
+    Json(result)
+}
+
+async fn list_clients(State(state): State<AppState>) -> impl IntoResponse {
+    let api_key = state.engine.auth_settings().api_key;
+    Json(json!({
+        "profiles": state.takeover.list_profiles(api_key.as_deref())
+    }))
+}
+
+async fn get_auth_settings(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.engine.auth_settings())
+}
+
+async fn set_auth_settings(
+    State(state): State<AppState>,
+    Json(req): Json<AuthSettings>,
+) -> impl IntoResponse {
+    match state
+        .engine
+        .set_auth_settings(req.api_key, req.admin_password)
+    {
+        Ok(updated) => Json(json!({ "ok": true, "auth": updated })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
@@ -219,6 +382,33 @@ async fn handle_anthropic(
     dispatch(state, UpstreamProtocol::Anthropic, headers, payload).await
 }
 
+async fn handle_anthropic_count_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if !state.engine.verify_api_auth(extract_inbound_token(&headers)) {
+        let body = state.engine.format_error(
+            UpstreamProtocol::Anthropic,
+            "authentication_error",
+            "invalid or missing local gateway API key",
+        );
+        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    }
+    match state.engine.count_tokens(payload).await {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(state.engine.format_error(
+                UpstreamProtocol::Anthropic,
+                "invalid_request_error",
+                &e.to_string(),
+            )),
+        )
+            .into_response(),
+    }
+}
+
 async fn handle_openai(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -282,14 +472,11 @@ async fn dispatch(
     headers: HeaderMap,
     payload: Value,
 ) -> Response {
-    if !state
-        .engine
-        .verify_inbound_auth(extract_inbound_token(&headers))
-    {
+    if !state.engine.verify_api_auth(extract_inbound_token(&headers)) {
         let body = state.engine.format_error(
             protocol,
             "authentication_error",
-            "invalid or missing local gateway token",
+            "invalid or missing local gateway API key",
         );
         return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
     }
@@ -411,5 +598,5 @@ async fn dispatch(
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    info!("received Ctrl+C, shutting down edge-gateway daemon cleanly");
+    info!("received Ctrl+C, shutting down LoomGate daemon cleanly");
 }

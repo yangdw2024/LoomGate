@@ -7,9 +7,10 @@ use axum::{
     Json, Router,
 };
 use gateway_core::{
-    ChannelSnapshot, CliIntegrationStatus, CliTakeoverManager, CliTool, CloudSessionStatus,
-    ForkDiffResult, GatewayConfig, GatewayEngine, GatewayError, GatewayResponse, RouteMode,
-    SessionSummary, TrajectoryStep, UpstreamProtocol,
+    AuthSettings, ChannelConfig, ChannelSnapshot, ChannelTestResult, CliIntegrationStatus,
+    CliTakeoverManager, CliTool, ClientProfileStatus, CloudSessionStatus, ForkDiffResult,
+    GatewayConfig, GatewayEngine, GatewayError, GatewayResponse, RouteMode, SessionSummary,
+    TrajectoryStep, UpstreamProtocol,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -233,6 +234,94 @@ fn cloud_logout(state: TauriState<'_, DesktopState>) -> CloudSessionStatus {
 }
 
 #[tauri::command]
+fn get_auth_settings(state: TauriState<'_, DesktopState>) -> AuthSettings {
+    state.engine.auth_settings()
+}
+
+#[tauri::command]
+fn set_auth_settings(
+    state: TauriState<'_, DesktopState>,
+    api_key: Option<String>,
+    admin_password: Option<String>,
+) -> Result<AuthSettings, String> {
+    state
+        .engine
+        .set_auth_settings(api_key, admin_password)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_channel_configs(state: TauriState<'_, DesktopState>) -> Vec<ChannelConfig> {
+    state.engine.list_channel_configs()
+}
+
+#[tauri::command]
+fn upsert_channel(
+    state: TauriState<'_, DesktopState>,
+    channel: ChannelConfig,
+) -> Result<ChannelSnapshot, String> {
+    state
+        .engine
+        .upsert_channel(channel)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_channel(state: TauriState<'_, DesktopState>, id: String) -> Result<bool, String> {
+    state.engine.delete_channel(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn toggle_channel(
+    state: TauriState<'_, DesktopState>,
+    id: String,
+    enabled: bool,
+) -> Result<ChannelSnapshot, String> {
+    state
+        .engine
+        .set_channel_enabled(&id, enabled)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn test_channel_connection(
+    state: TauriState<'_, DesktopState>,
+    channel: ChannelConfig,
+) -> Result<ChannelTestResult, String> {
+    Ok(state.engine.test_channel_connection(channel).await)
+}
+
+#[tauri::command]
+fn list_client_profiles(state: TauriState<'_, DesktopState>) -> Vec<ClientProfileStatus> {
+    let api_key = state.engine.auth_settings().api_key;
+    state.takeover.list_profiles(api_key.as_deref())
+}
+
+#[tauri::command]
+fn takeover_client_profile(
+    state: TauriState<'_, DesktopState>,
+    profile_id: String,
+) -> Result<ClientProfileStatus, String> {
+    let api_key = state.engine.auth_settings().api_key;
+    state
+        .takeover
+        .takeover_by_id(&profile_id, api_key.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn restore_client_profile(
+    state: TauriState<'_, DesktopState>,
+    profile_id: String,
+) -> Result<ClientProfileStatus, String> {
+    let api_key = state.engine.auth_settings().api_key;
+    state
+        .takeover
+        .restore_by_id(&profile_id, api_key.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn list_cli_integrations(state: TauriState<'_, DesktopState>) -> Vec<CliIntegrationStatus> {
     state.takeover.list_statuses()
 }
@@ -292,6 +381,7 @@ async fn run_embedded_proxy(
     let app = Router::new()
         .route("/healthz", get(proxy_healthz))
         .route("/v1/messages", post(proxy_anthropic))
+        .route("/v1/messages/count_tokens", post(proxy_anthropic_count_tokens))
         .route("/v1/chat/completions", post(proxy_openai))
         .route("/v1beta/models/:model_action", post(proxy_gemini))
         .with_state(engine);
@@ -333,6 +423,33 @@ async fn proxy_anthropic(
     Json(payload): Json<Value>,
 ) -> Response {
     dispatch(engine, UpstreamProtocol::Anthropic, headers, payload).await
+}
+
+async fn proxy_anthropic_count_tokens(
+    State(engine): State<Arc<GatewayEngine>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if !engine.verify_api_auth(extract_inbound_token(&headers)) {
+        let body = engine.format_error(
+            UpstreamProtocol::Anthropic,
+            "authentication_error",
+            "invalid or missing local gateway API key",
+        );
+        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    }
+    match engine.count_tokens(payload).await {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(engine.format_error(
+                UpstreamProtocol::Anthropic,
+                "invalid_request_error",
+                &e.to_string(),
+            )),
+        )
+            .into_response(),
+    }
 }
 
 async fn proxy_openai(
@@ -492,9 +609,16 @@ async fn dispatch(
     }
 }
 
-fn load_config_and_db() -> (GatewayConfig, PathBuf) {
+fn load_config_and_db() -> (GatewayConfig, PathBuf, PathBuf) {
     let config_path = std::env::var("GATEWAY_CONFIG")
         .unwrap_or_else(|_| "../../../config.example.toml".to_string());
+    let persist_path = {
+        let loaded = PathBuf::from(&config_path);
+        match loaded.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join("config.local.toml"),
+            _ => PathBuf::from("config.local.toml"),
+        }
+    };
     let config = GatewayConfig::from_file(&config_path).unwrap_or_else(|_| GatewayConfig {
         server: Default::default(),
         routing: Default::default(),
@@ -505,7 +629,7 @@ fn load_config_and_db() -> (GatewayConfig, PathBuf) {
     let db_path = std::env::var("GATEWAY_DB_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(".edge-gateway/trajectory.db"));
-    (config, db_path)
+    (config, db_path, persist_path)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -514,7 +638,7 @@ pub fn run() {
         .with_env_filter("edge_gateway_desktop=info,gateway_core=info")
         .try_init();
 
-    let (config, db_path) = load_config_and_db();
+    let (config, db_path, persist_path) = load_config_and_db();
     let bind_addr = config.server.bind_addr.clone();
     let gateway_url = format!("http://{}", bind_addr);
 
@@ -522,6 +646,7 @@ pub fn run() {
         GatewayEngine::new_with_sqlite(config, &db_path)
             .expect("failed to initialize embedded GatewayEngine with SQLite WAL"),
     );
+    engine.set_persist_config_path(persist_path);
     let takeover = CliTakeoverManager::new(gateway_url)
         .expect("failed to initialize CliTakeoverManager");
 
@@ -609,6 +734,16 @@ pub fn run() {
             set_route_mode,
             get_local_auth_token,
             set_local_auth_token,
+            get_auth_settings,
+            set_auth_settings,
+            list_channel_configs,
+            upsert_channel,
+            delete_channel,
+            toggle_channel,
+            test_channel_connection,
+            list_client_profiles,
+            takeover_client_profile,
+            restore_client_profile,
             get_autostart_enabled,
             set_autostart_enabled,
             get_cloud_status,

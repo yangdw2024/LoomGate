@@ -7,20 +7,67 @@ type TabId = "channels" | "takeover" | "trajectory";
 interface ChannelSnapshot {
   id: string;
   protocol: string;
+  base_url: string;
+  enabled: boolean;
+  weight: number;
+  models: string[];
+  proxy_url: string | null;
+  fallback_models: string[];
+  quota_endpoint: string | null;
   health: "healthy" | "cooldown" | "quarantined";
+  cooldown_remaining_secs: number;
+  quarantine_remaining_secs: number;
   inflight: number;
   ewma_ttft_ms: number | null;
   total_requests: number;
 }
 
-interface CliIntegrationStatus {
-  tool: "claude_code" | "codex" | "gemini_cli";
+interface ChannelConfig {
+  id: string;
+  protocol: "anthropic" | "openai" | "gemini";
+  base_url: string;
+  api_key: string;
+  weight: number;
+  enabled: boolean;
+  models: string[];
+  model_map: Record<string, string>;
+  proxy_url?: string | null;
+  fallback_models: string[];
+  quota_endpoint?: string | null;
+}
+
+interface ChannelTestResult {
+  ok: boolean;
+  channel_id: string;
+  status_code: number | null;
+  latency_ms: number;
+  endpoint: string;
+  message: string;
+  quota_info?: unknown;
+}
+
+interface AuthSettings {
+  api_key: string | null;
+  admin_password: string | null;
+}
+
+interface ClientProfileStatus {
+  id: string;
   display_name: string;
-  config_path: string;
+  category: string;
+  kind: "atomic_takeover" | "setup_wizard";
+  description: string;
+  custom: boolean;
+  config_path: string | null;
   installed: boolean;
   taken_over: boolean;
   has_backup: boolean;
   active_endpoint: string | null;
+  wizard_endpoint: string | null;
+  wizard_protocol: string | null;
+  env_snippet: string | null;
+  config_snippet: string | null;
+  instructions: string[];
 }
 
 interface SessionSummary {
@@ -117,12 +164,33 @@ function computeLineDiff(oldText: string, newText: string): DiffLine[] {
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+const emptyChannelForm = () => ({
+  id: "",
+  protocol: "openai" as "anthropic" | "openai" | "gemini",
+  base_url: "https://api.openai.com",
+  api_key: "",
+  weight: 100,
+  enabled: true,
+  modelsText: "gpt-4o, gpt-4o-mini",
+  proxy_url: "",
+  fallbackText: "",
+  quota_endpoint: "",
+});
+
 export default function App() {
   const [tab, setTab] = useState<TabId>("channels");
   const [bindAddr, setBindAddr] = useState("127.0.0.1:8787");
   const [routeMode, setRouteMode] = useState<"lock" | "stage_aware">("lock");
   const [channels, setChannels] = useState<ChannelSnapshot[]>([]);
-  const [clis, setClis] = useState<CliIntegrationStatus[]>([]);
+  const [channelConfigs, setChannelConfigs] = useState<ChannelConfig[]>([]);
+  const [showChannelForm, setShowChannelForm] = useState(false);
+  const [chForm, setChForm] = useState(emptyChannelForm);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, ChannelTestResult>>({});
+
+  const [profiles, setProfiles] = useState<ClientProfileStatus[]>([]);
+  const [selectedWizardId, setSelectedWizardId] = useState<string>("cursor");
+
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [steps, setSteps] = useState<TrajectoryStep[]>([]);
@@ -130,10 +198,13 @@ export default function App() {
   const [forkingStep, setForkingStep] = useState<string | null>(null);
   const [diffResult, setDiffResult] = useState<ForkDiffResult | null>(null);
   const [diffViewMode, setDiffViewMode] = useState<"unified" | "split">("unified");
+
   const [autostart, setAutostart] = useState<boolean>(false);
-  const [authTokenInput, setAuthTokenInput] = useState<string>("");
-  const [activeAuthToken, setActiveAuthToken] = useState<string | null>(null);
-  const [showAuthToken, setShowAuthToken] = useState<boolean>(false);
+  const [apiKeyInput, setApiKeyInput] = useState<string>("");
+  const [adminPasswordInput, setAdminPasswordInput] = useState<string>("");
+  const [activeAuth, setActiveAuth] = useState<AuthSettings>({ api_key: null, admin_password: null });
+  const [showSecrets, setShowSecrets] = useState<boolean>(false);
+
   const [cloudStatus, setCloudStatus] = useState<CloudSessionStatus | null>(null);
   const [cloudUrl, setCloudUrl] = useState("http://127.0.0.1:8790");
   const [cloudEmail, setCloudEmail] = useState("dev@loomgate.dev");
@@ -151,8 +222,11 @@ export default function App() {
     setRouteMode(status.route_mode);
     setChannels(status.channels);
 
-    const cliList = await invoke<CliIntegrationStatus[]>("list_cli_integrations");
-    setClis(cliList);
+    const cfgList = await invoke<ChannelConfig[]>("list_channel_configs");
+    setChannelConfigs(cfgList);
+
+    const profList = await invoke<ClientProfileStatus[]>("list_client_profiles");
+    setProfiles(profList);
 
     const cloud = await invoke<CloudSessionStatus>("get_cloud_status");
     setCloudStatus(cloud);
@@ -172,10 +246,11 @@ export default function App() {
     invoke<boolean>("get_autostart_enabled")
       .then(setAutostart)
       .catch(() => {});
-    invoke<string | null>("get_local_auth_token")
-      .then((tok) => {
-        setActiveAuthToken(tok);
-        setAuthTokenInput(tok ?? "");
+    invoke<AuthSettings>("get_auth_settings")
+      .then((auth) => {
+        setActiveAuth(auth);
+        setApiKeyInput(auth.api_key ?? "");
+        setAdminPasswordInput(auth.admin_password ?? "");
       })
       .catch(() => {});
   }, []);
@@ -184,7 +259,7 @@ export default function App() {
     refreshAll().catch((e) => setNotice(String(e)));
     const timer = setInterval(() => {
       refreshAll().catch(() => {});
-    }, 3000);
+    }, 2000);
     let unlisten: (() => void) | undefined;
     if (isTauri()) {
       listen<"lock" | "stage_aware">("route-mode-changed", (event) => {
@@ -209,6 +284,103 @@ export default function App() {
     setNotice(`Route mode hot-switched to ${mode}`);
   }
 
+  function openNewChannelForm() {
+    setChForm(emptyChannelForm());
+    setShowChannelForm(true);
+  }
+
+  function openEditChannelForm(id: string) {
+    const existing = channelConfigs.find((c) => c.id === id);
+    if (!existing) return;
+    setChForm({
+      id: existing.id,
+      protocol: existing.protocol,
+      base_url: existing.base_url,
+      api_key: existing.api_key,
+      weight: existing.weight,
+      enabled: existing.enabled,
+      modelsText: existing.models.join(", "),
+      proxy_url: existing.proxy_url ?? "",
+      fallbackText: (existing.fallback_models ?? []).join(", "),
+      quota_endpoint: existing.quota_endpoint ?? "",
+    });
+    setShowChannelForm(true);
+  }
+
+  function buildChannelFromForm(): ChannelConfig {
+    const splitCsv = (s: string) =>
+      s
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+    return {
+      id: chForm.id.trim(),
+      protocol: chForm.protocol,
+      base_url: chForm.base_url.trim(),
+      api_key: chForm.api_key.trim(),
+      weight: Math.max(1, Number(chForm.weight) || 100),
+      enabled: chForm.enabled,
+      models: splitCsv(chForm.modelsText),
+      model_map: {},
+      proxy_url: chForm.proxy_url.trim() || null,
+      fallback_models: splitCsv(chForm.fallbackText),
+      quota_endpoint: chForm.quota_endpoint.trim() || null,
+    };
+  }
+
+  async function handleSaveChannel() {
+    if (!isTauri()) return;
+    try {
+      const payload = buildChannelFromForm();
+      const saved = await invoke<ChannelSnapshot>("upsert_channel", { channel: payload });
+      setShowChannelForm(false);
+      await refreshAll();
+      setNotice(
+        `Saved channel '${saved.id}' (${saved.base_url}) and persisted atomically to config.local.toml.`
+      );
+    } catch (e) {
+      setNotice(`Save channel failed: ${String(e)}`);
+    }
+  }
+
+  async function handleDeleteChannel(id: string) {
+    if (!isTauri()) return;
+    try {
+      await invoke<boolean>("delete_channel", { id });
+      await refreshAll();
+      setNotice(`Removed channel '${id}' from live pool and config.local.toml.`);
+    } catch (e) {
+      setNotice(`Delete channel failed: ${String(e)}`);
+    }
+  }
+
+  async function handleToggleChannel(id: string, enabled: boolean) {
+    if (!isTauri()) return;
+    try {
+      await invoke<ChannelSnapshot>("toggle_channel", { id, enabled });
+      await refreshAll();
+      setNotice(`Channel '${id}' ${enabled ? "enabled" : "disabled"}.`);
+    } catch (e) {
+      setNotice(`Toggle channel failed: ${String(e)}`);
+    }
+  }
+
+  async function handleTestChannel(cfg: ChannelConfig) {
+    if (!isTauri()) return;
+    setTestingId(cfg.id || "__draft__");
+    try {
+      const res = await invoke<ChannelTestResult>("test_channel_connection", { channel: cfg });
+      setTestResults((prev) => ({ ...prev, [cfg.id || "__draft__"]: res }));
+      setNotice(
+        `Probe '${cfg.id || "draft"}': ${res.ok ? "OK" : "FAIL"} (${res.latency_ms} ms) — ${res.message}`
+      );
+    } catch (e) {
+      setNotice(`Probe failed: ${String(e)}`);
+    } finally {
+      setTestingId(null);
+    }
+  }
+
   async function toggleAutostart() {
     if (!isTauri()) return;
     try {
@@ -220,34 +392,33 @@ export default function App() {
     }
   }
 
-  async function saveAuthToken() {
+  async function saveAuthSettings() {
     if (!isTauri()) return;
-    const saved = await invoke<string | null>("set_local_auth_token", {
-      token: authTokenInput.trim() || null,
-    });
-    setActiveAuthToken(saved);
-    setAuthTokenInput(saved ?? "");
-    setNotice(
-      saved
-        ? "Local inbound auth token active (enforced for x-api-key / Bearer / x-goog-api-key)."
-        : "Local inbound auth disabled (open localhost dev mode)."
-    );
+    try {
+      const saved = await invoke<AuthSettings>("set_auth_settings", {
+        apiKey: apiKeyInput.trim() || null,
+        adminPassword: adminPasswordInput.trim() || null,
+      });
+      setActiveAuth(saved);
+      setApiKeyInput(saved.api_key ?? "");
+      setAdminPasswordInput(saved.admin_password ?? "");
+      await refreshAll();
+      setNotice(
+        `Auth settings saved to config.local.toml (API Key: ${
+          saved.api_key ? "Protected" : "Open"
+        }, Admin Password: ${saved.admin_password ? "Protected" : "Open"}).`
+      );
+    } catch (e) {
+      setNotice(`Save auth settings failed: ${String(e)}`);
+    }
   }
 
-  async function clearAuthToken() {
-    if (!isTauri()) return;
-    await invoke<string | null>("set_local_auth_token", { token: null });
-    setActiveAuthToken(null);
-    setAuthTokenInput("");
-    setNotice("Local inbound auth token cleared.");
-  }
-
-  function generateRandomToken() {
+  function generateRandomSecret(prefix: string, setter: (v: string) => void) {
     const bytes = new Uint8Array(18);
     crypto.getRandomValues(bytes);
     const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-    setAuthTokenInput(`lg_${hex}`);
-    setShowAuthToken(true);
+    setter(`${prefix}_${hex}`);
+    setShowSecrets(true);
   }
 
   async function handleCloudLogin() {
@@ -260,7 +431,9 @@ export default function App() {
       });
       setCloudStatus(st);
       await refreshAll();
-      setNotice(`Connected to Cloud Control Plane (${st.tenant_id}, ${st.synced_channels} team channels synced).`);
+      setNotice(
+        `Connected to Cloud Control Plane (${st.tenant_id}, ${st.synced_channels} team channels synced).`
+      );
     } catch (e) {
       setNotice(`Cloud login failed: ${String(e)}`);
     }
@@ -285,18 +458,35 @@ export default function App() {
     setNotice("Disconnected from Cloud Control Plane (running in local-only privacy mode).");
   }
 
-  async function handleTakeover(tool: CliIntegrationStatus["tool"]) {
+  async function handleTakeoverProfile(profileId: string) {
     if (!isTauri()) return;
-    await invoke("takeover_cli_config", { tool });
-    await refreshAll();
-    setNotice(`Atomically took over ${tool} config (backup created).`);
+    try {
+      await invoke("takeover_client_profile", { profileId });
+      await refreshAll();
+      setNotice(`Atomically took over '${profileId}' config (backup created).`);
+    } catch (e) {
+      setNotice(`Takeover failed: ${String(e)}`);
+    }
   }
 
-  async function handleRestore(tool: CliIntegrationStatus["tool"]) {
+  async function handleRestoreProfile(profileId: string) {
     if (!isTauri()) return;
-    await invoke("restore_cli_config", { tool });
-    await refreshAll();
-    setNotice(`Restored original ${tool} config.`);
+    try {
+      await invoke("restore_client_profile", { profileId });
+      await refreshAll();
+      setNotice(`Restored original '${profileId}' config from backup.`);
+    } catch (e) {
+      setNotice(`Restore failed: ${String(e)}`);
+    }
+  }
+
+  async function copyText(label: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setNotice(`Copied ${label} to clipboard.`);
+    } catch {
+      setNotice(`Clipboard unavailable — select and copy ${label} manually.`);
+    }
   }
 
   async function openSession(sessionId: string) {
@@ -329,6 +519,11 @@ export default function App() {
     }
   }
 
+  const atomicProfiles = profiles.filter((p) => p.kind === "atomic_takeover");
+  const wizardProfiles = profiles.filter((p) => p.kind === "setup_wizard");
+  const activeWizard =
+    wizardProfiles.find((p) => p.id === selectedWizardId) || wizardProfiles[0] || null;
+
   return (
     <div className="layout">
       <header className="topbar">
@@ -349,7 +544,7 @@ export default function App() {
             className={`tab ${tab === "takeover" ? "active" : ""}`}
             onClick={() => setTab("takeover")}
           >
-            CLI Takeover
+            Client Integrations
           </button>
           <button
             className={`tab ${tab === "trajectory" ? "active" : ""}`}
@@ -376,7 +571,7 @@ export default function App() {
               <div>
                 <h3>Explicit Routing Policy (Zero Silent Downgrade)</h3>
                 <span style={{ color: "var(--muted)" }}>
-                  Hot-switch live without restarting active CLI terminals.
+                  Hot-switch live without restarting active CLI terminals or IDE agents.
                 </span>
               </div>
               <div style={{ display: "flex", gap: 8 }}>
@@ -396,45 +591,252 @@ export default function App() {
             </div>
 
             <div className="card">
-              <h3>P2C Upstream Channel Pool</h3>
+              <div className="row" style={{ marginBottom: 12 }}>
+                <h3 style={{ margin: 0 }}>P2C Upstream Channel Pool (Hot-Editable → config.local.toml)</h3>
+                <button className="btn" onClick={openNewChannelForm}>
+                  + Add Channel
+                </button>
+              </div>
+
+              {showChannelForm && (
+                <div
+                  className="card"
+                  style={{ borderColor: "var(--accent)", background: "var(--bg)", marginBottom: 14 }}
+                >
+                  <div className="row" style={{ marginBottom: 10 }}>
+                    <strong>{chForm.id ? `Edit Channel: ${chForm.id}` : "Add Upstream Channel"}</strong>
+                    <button className="btn secondary" onClick={() => setShowChannelForm(false)}>
+                      Cancel
+                    </button>
+                  </div>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                      gap: 10,
+                    }}
+                  >
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>Channel ID</span>
+                      <input
+                        value={chForm.id}
+                        onChange={(e) => setChForm({ ...chForm, id: e.target.value })}
+                        placeholder="openai-live"
+                      />
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>Protocol</span>
+                      <select
+                        value={chForm.protocol}
+                        onChange={(e) =>
+                          setChForm({
+                            ...chForm,
+                            protocol: e.target.value as "anthropic" | "openai" | "gemini",
+                          })
+                        }
+                      >
+                        <option value="anthropic">Anthropic (/v1/messages)</option>
+                        <option value="openai">OpenAI (/v1/chat/completions)</option>
+                        <option value="gemini">Gemini (/v1beta/models)</option>
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                        Base URL (trailing /v1 auto-stripped)
+                      </span>
+                      <input
+                        value={chForm.base_url}
+                        onChange={(e) => setChForm({ ...chForm, base_url: e.target.value })}
+                        placeholder="https://api.openai.com"
+                      />
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>Upstream API Key</span>
+                      <input
+                        type="password"
+                        value={chForm.api_key}
+                        onChange={(e) => setChForm({ ...chForm, api_key: e.target.value })}
+                        placeholder="sk-..."
+                      />
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>Models (comma-separated)</span>
+                      <input
+                        value={chForm.modelsText}
+                        onChange={(e) => setChForm({ ...chForm, modelsText: e.target.value })}
+                        placeholder="gpt-4o, gpt-4o-mini"
+                      />
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>Weight</span>
+                      <input
+                        type="number"
+                        min={1}
+                        value={chForm.weight}
+                        onChange={(e) => setChForm({ ...chForm, weight: Number(e.target.value) })}
+                      />
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                        Proxy URL (optional HTTP / SOCKS5)
+                      </span>
+                      <input
+                        value={chForm.proxy_url}
+                        onChange={(e) => setChForm({ ...chForm, proxy_url: e.target.value })}
+                        placeholder="socks5h://127.0.0.1:1080"
+                      />
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                        Fallback Models (Stage-Aware CSV)
+                      </span>
+                      <input
+                        value={chForm.fallbackText}
+                        onChange={(e) => setChForm({ ...chForm, fallbackText: e.target.value })}
+                        placeholder="gpt-4o-mini"
+                      />
+                    </label>
+                    <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                        Quota Probe Endpoint (optional)
+                      </span>
+                      <input
+                        value={chForm.quota_endpoint}
+                        onChange={(e) => setChForm({ ...chForm, quota_endpoint: e.target.value })}
+                        placeholder="https://provider/v1/balance"
+                      />
+                    </label>
+                  </div>
+                  <div className="row" style={{ marginTop: 12 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                      <input
+                        type="checkbox"
+                        checked={chForm.enabled}
+                        onChange={(e) => setChForm({ ...chForm, enabled: e.target.checked })}
+                      />
+                      Enabled in P2C pool
+                    </label>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        className="btn secondary"
+                        disabled={testingId !== null}
+                        onClick={() => handleTestChannel(buildChannelFromForm())}
+                      >
+                        Test Connection
+                      </button>
+                      <button className="btn" onClick={handleSaveChannel}>
+                        Save &amp; Persist
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <table>
                 <thead>
                   <tr>
                     <th>Channel ID</th>
-                    <th>Protocol</th>
-                    <th>Health</th>
+                    <th>Protocol / Endpoint</th>
+                    <th>Health &amp; Cooldown</th>
                     <th>Inflight</th>
                     <th>EWMA TTFT</th>
                     <th>Total Req</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {channels.map((ch) => (
-                    <tr key={ch.id}>
-                      <td>{ch.id}</td>
-                      <td>{ch.protocol}</td>
-                      <td>
-                        <span
-                          className={`pill ${
-                            ch.health === "healthy"
-                              ? "ok"
-                              : ch.health === "cooldown"
-                              ? "warn"
-                              : "err"
-                          }`}
-                        >
-                          {ch.health}
-                        </span>
-                      </td>
-                      <td>{ch.inflight}</td>
-                      <td>{ch.ewma_ttft_ms !== null ? `${ch.ewma_ttft_ms} ms` : "—"}</td>
-                      <td>{ch.total_requests}</td>
-                    </tr>
-                  ))}
+                  {channels.map((ch) => {
+                    const cfg = channelConfigs.find((c) => c.id === ch.id);
+                    const probe = testResults[ch.id];
+                    const healthLabel = !ch.enabled
+                      ? "disabled"
+                      : ch.health === "cooldown"
+                      ? `cooldown (${ch.cooldown_remaining_secs}s)`
+                      : ch.health === "quarantined"
+                      ? `quarantined (${ch.quarantine_remaining_secs}s)`
+                      : "healthy";
+                    return (
+                      <tr key={ch.id} style={{ opacity: ch.enabled ? 1 : 0.6 }}>
+                        <td>
+                          <strong>{ch.id}</strong>
+                          {ch.proxy_url && (
+                            <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                              proxy: {ch.proxy_url}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <span className="pill">{ch.protocol}</span>
+                          <div
+                            style={{
+                              fontSize: 11,
+                              color: "var(--muted)",
+                              fontFamily: "monospace",
+                              marginTop: 2,
+                            }}
+                          >
+                            {ch.base_url}
+                          </div>
+                        </td>
+                        <td>
+                          <span
+                            className={`pill ${
+                              !ch.enabled
+                                ? ""
+                                : ch.health === "healthy"
+                                ? "ok"
+                                : ch.health === "cooldown"
+                                ? "warn"
+                                : "err"
+                            }`}
+                          >
+                            {healthLabel}
+                          </span>
+                          {probe && (
+                            <div style={{ fontSize: 11, color: probe.ok ? "var(--ok)" : "var(--err)", marginTop: 2 }}>
+                              {probe.ok ? "✓" : "✗"} {probe.latency_ms}ms · {probe.message}
+                            </div>
+                          )}
+                        </td>
+                        <td>{ch.inflight}</td>
+                        <td>{ch.ewma_ttft_ms !== null ? `${ch.ewma_ttft_ms} ms` : "—"}</td>
+                        <td>{ch.total_requests}</td>
+                        <td style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                          {cfg && (
+                            <button
+                              className="btn secondary"
+                              disabled={testingId === ch.id}
+                              onClick={() => handleTestChannel(cfg)}
+                            >
+                              {testingId === ch.id ? "Testing..." : "Test"}
+                            </button>
+                          )}
+                          <button
+                            className="btn secondary"
+                            onClick={() => handleToggleChannel(ch.id, !ch.enabled)}
+                          >
+                            {ch.enabled ? "Disable" : "Enable"}
+                          </button>
+                          <button
+                            className="btn secondary"
+                            onClick={() => openEditChannelForm(ch.id)}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            className="btn secondary"
+                            onClick={() => handleDeleteChannel(ch.id)}
+                          >
+                            Delete
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                   {channels.length === 0 && (
                     <tr>
-                      <td colSpan={6} style={{ color: "var(--muted)" }}>
-                        No channels loaded (launch via `npm run tauri dev` to connect to embedded kernel).
+                      <td colSpan={7} style={{ color: "var(--muted)" }}>
+                        No channels loaded. Click "+ Add Channel" to configure your first upstream.
                       </td>
                     </tr>
                   )}
@@ -443,7 +845,7 @@ export default function App() {
             </div>
 
             <div className="card">
-              <h3>System &amp; Local Security</h3>
+              <h3>System &amp; Split Local Security</h3>
               <div className="row" style={{ marginBottom: 14 }}>
                 <div>
                   <strong>Launch LoomGate at Login</strong>
@@ -458,45 +860,78 @@ export default function App() {
                   {autostart ? "Enabled" : "Disabled"}
                 </button>
               </div>
-              <div className="row" style={{ alignItems: "flex-end", flexWrap: "wrap" }}>
-                <div style={{ flex: 1, minWidth: 260 }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+                  gap: 12,
+                  marginBottom: 10,
+                }}
+              >
+                <div>
                   <div style={{ marginBottom: 4 }}>
-                    <strong>Local Inbound Auth Token</strong>{" "}
-                    <span className={`pill ${activeAuthToken ? "ok" : ""}`}>
-                      {activeAuthToken ? "Protected" : "Open Localhost"}
+                    <strong>Inference API Key</strong>{" "}
+                    <span className={`pill ${activeAuth.api_key ? "ok" : ""}`}>
+                      {activeAuth.api_key ? "Protected (/v1/*, /v1beta/*)" : "Open Localhost"}
                     </span>
                   </div>
-                  <div style={{ color: "var(--muted)", fontSize: 12, marginBottom: 6 }}>
-                    When set, inbound requests to {bindAddr} must pass this token via{" "}
-                    <code>x-api-key</code>, <code>Authorization: Bearer</code>, or{" "}
-                    <code>x-goog-api-key</code>.
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <input
+                      type={showSecrets ? "text" : "password"}
+                      style={{ flex: 1, fontFamily: "monospace" }}
+                      value={apiKeyInput}
+                      onChange={(e) => setApiKeyInput(e.target.value)}
+                      placeholder="Empty = passwordless localhost inference"
+                    />
+                    <button
+                      className="btn secondary"
+                      onClick={() => generateRandomSecret("lg", setApiKeyInput)}
+                    >
+                      Gen
+                    </button>
                   </div>
-                  <input
-                    type={showAuthToken ? "text" : "password"}
-                    style={{ width: "100%", fontFamily: "monospace" }}
-                    value={authTokenInput}
-                    onChange={(e) => setAuthTokenInput(e.target.value)}
-                    placeholder="Leave empty to allow unauthenticated local CLI requests"
-                  />
                 </div>
+
+                <div>
+                  <div style={{ marginBottom: 4 }}>
+                    <strong>Admin Password</strong>{" "}
+                    <span className={`pill ${activeAuth.admin_password ? "ok" : ""}`}>
+                      {activeAuth.admin_password ? "Protected (/api/*)" : "Open Localhost"}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <input
+                      type={showSecrets ? "text" : "password"}
+                      style={{ flex: 1, fontFamily: "monospace" }}
+                      value={adminPasswordInput}
+                      onChange={(e) => setAdminPasswordInput(e.target.value)}
+                      placeholder="Empty = passwordless localhost admin"
+                    />
+                    <button
+                      className="btn secondary"
+                      onClick={() => generateRandomSecret("lgadm", setAdminPasswordInput)}
+                    >
+                      Gen
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="row">
+                <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                  Inference accepts <code>x-api-key</code> / <code>Bearer</code> /{" "}
+                  <code>x-goog-api-key</code>. Admin APIs accept <code>x-admin-password</code> /{" "}
+                  <code>Bearer</code>.
+                </span>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button
                     className="btn secondary"
-                    onClick={() => setShowAuthToken((v) => !v)}
+                    onClick={() => setShowSecrets((v) => !v)}
                   >
-                    {showAuthToken ? "Hide" : "Show"}
+                    {showSecrets ? "Hide" : "Show"}
                   </button>
-                  <button className="btn secondary" onClick={generateRandomToken}>
-                    Generate
+                  <button className="btn" onClick={saveAuthSettings}>
+                    Save Auth Settings
                   </button>
-                  <button className="btn" onClick={saveAuthToken}>
-                    Save
-                  </button>
-                  {activeAuthToken && (
-                    <button className="btn secondary" onClick={clearAuthToken}>
-                      Clear
-                    </button>
-                  )}
                 </div>
               </div>
             </div>
@@ -563,47 +998,148 @@ export default function App() {
         )}
 
         {tab === "takeover" && (
-          <div className="card">
-            <h3>One-Click Atomic CLI Config Takeover (CC Switch Pattern)</h3>
-            <table>
-              <thead>
-                <tr>
-                  <th>Client</th>
-                  <th>Config Path</th>
-                  <th>Status</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {clis.map((c) => (
-                  <tr key={c.tool}>
-                    <td>{c.display_name}</td>
-                    <td style={{ color: "var(--muted)", fontFamily: "monospace", fontSize: 12 }}>
-                      {c.config_path}
-                    </td>
-                    <td>
-                      <span className={`pill ${c.taken_over ? "ok" : ""}`}>
-                        {c.taken_over ? "Proxied" : "Direct"}
-                      </span>
-                    </td>
-                    <td style={{ display: "flex", gap: 8 }}>
-                      <button className="btn" onClick={() => handleTakeover(c.tool)}>
-                        {c.taken_over ? "Re-Apply" : "Take Over"}
-                      </button>
-                      {c.has_backup && (
-                        <button
-                          className="btn secondary"
-                          onClick={() => handleRestore(c.tool)}
-                        >
-                          Restore
-                        </button>
-                      )}
-                    </td>
+          <>
+            <div className="card">
+              <div className="row" style={{ marginBottom: 8 }}>
+                <h3 style={{ margin: 0 }}>
+                  Atomic CLI Config Takeover (Auto .bak Rollback)
+                </h3>
+                <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                  Extensible via <code>~/.loomgate/client_profiles.json</code> or{" "}
+                  <code>.toml</code>
+                </span>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Client</th>
+                    <th>Config Path</th>
+                    <th>Status</th>
+                    <th>Action</th>
                   </tr>
+                </thead>
+                <tbody>
+                  {atomicProfiles.map((c) => (
+                    <tr key={c.id}>
+                      <td>
+                        <strong>{c.display_name}</strong>{" "}
+                        {c.custom && <span className="pill">Custom</span>}
+                      </td>
+                      <td style={{ color: "var(--muted)", fontFamily: "monospace", fontSize: 12 }}>
+                        {c.config_path}
+                      </td>
+                      <td>
+                        <span className={`pill ${c.taken_over ? "ok" : ""}`}>
+                          {c.taken_over ? "Proxied" : "Direct"}
+                        </span>
+                      </td>
+                      <td style={{ display: "flex", gap: 8 }}>
+                        <button className="btn" onClick={() => handleTakeoverProfile(c.id)}>
+                          {c.taken_over ? "Re-Apply" : "Take Over"}
+                        </button>
+                        {c.has_backup && (
+                          <button
+                            className="btn secondary"
+                            onClick={() => handleRestoreProfile(c.id)}
+                          >
+                            Restore
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="card">
+              <h3>IDE &amp; SDK Setup Wizards (One-Click Copy)</h3>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+                {wizardProfiles.map((w) => (
+                  <button
+                    key={w.id}
+                    className={`btn ${activeWizard?.id === w.id ? "" : "secondary"}`}
+                    onClick={() => setSelectedWizardId(w.id)}
+                  >
+                    {w.display_name}
+                    {w.custom ? " (Custom)" : ""}
+                  </button>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </div>
+              {activeWizard && (
+                <div>
+                  <div className="row" style={{ marginBottom: 8 }}>
+                    <div>
+                      <strong>{activeWizard.display_name}</strong>{" "}
+                      <span className="pill">{activeWizard.category}</span>{" "}
+                      {activeWizard.wizard_protocol && (
+                        <span className="pill ok">{activeWizard.wizard_protocol}</span>
+                      )}
+                    </div>
+                    {activeWizard.wizard_endpoint && (
+                      <button
+                        className="btn secondary"
+                        onClick={() => copyText("Endpoint URL", activeWizard.wizard_endpoint!)}
+                      >
+                        Copy URL: {activeWizard.wizard_endpoint}
+                      </button>
+                    )}
+                  </div>
+                  <p style={{ color: "var(--muted)", margin: "0 0 10px" }}>
+                    {activeWizard.description}
+                  </p>
+                  <ol style={{ margin: "0 0 12px", paddingLeft: 20, color: "var(--text)" }}>
+                    {activeWizard.instructions.map((step, idx) => (
+                      <li key={idx} style={{ marginBottom: 4 }}>
+                        {step}
+                      </li>
+                    ))}
+                  </ol>
+                  <div className="diff-grid">
+                    {activeWizard.env_snippet && (
+                      <div>
+                        <div className="row" style={{ marginBottom: 4 }}>
+                          <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                            Environment Variables
+                          </span>
+                          <button
+                            className="btn secondary"
+                            onClick={() =>
+                              copyText(`${activeWizard.display_name} env`, activeWizard.env_snippet!)
+                            }
+                          >
+                            Copy Env
+                          </button>
+                        </div>
+                        <pre>{activeWizard.env_snippet}</pre>
+                      </div>
+                    )}
+                    {activeWizard.config_snippet && (
+                      <div>
+                        <div className="row" style={{ marginBottom: 4 }}>
+                          <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                            JSON Config Snippet
+                          </span>
+                          <button
+                            className="btn secondary"
+                            onClick={() =>
+                              copyText(
+                                `${activeWizard.display_name} JSON`,
+                                activeWizard.config_snippet!
+                              )
+                            }
+                          >
+                            Copy JSON
+                          </button>
+                        </div>
+                        <pre>{activeWizard.config_snippet}</pre>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
         )}
 
         {tab === "trajectory" && (

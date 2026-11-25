@@ -1,6 +1,6 @@
 use crate::cloud_sync::{CloudSessionStatus, CloudSyncClient};
 use crate::codec::{codec_for, CodecError};
-use crate::config::{GatewayConfig, RouteMode, UpstreamProtocol};
+use crate::config::{ChannelConfig, ConfigError, GatewayConfig, RouteMode, UpstreamProtocol};
 use crate::error_gov::{classify_upstream_error, ErrorTier};
 use crate::ir::{CanonicalRequest, CanonicalStreamEvent, CanonicalUsage, ContentPart};
 use crate::middleware::guardrail::GuardrailMiddleware;
@@ -17,10 +17,11 @@ use crate::trajectory::{
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, Proxy};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -53,8 +54,28 @@ pub enum GatewayError {
         message: String,
         middleware: &'static str,
     },
+    #[error("config error: {0}")]
+    Config(#[from] ConfigError),
     #[error("transport error: {0}")]
     Transport(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSettings {
+    pub api_key: Option<String>,
+    pub admin_password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelTestResult {
+    pub ok: bool,
+    pub channel_id: String,
+    pub status_code: Option<u16>,
+    pub latency_ms: u64,
+    pub endpoint: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_info: Option<Value>,
 }
 
 /// Transparent routing & observability metadata attached as HTTP response headers.
@@ -255,8 +276,11 @@ pub struct GatewayEngine {
     mcp_bridge: Arc<McpBridgeMiddleware>,
     /// Hot-switchable global route mode (0 = Lock, 1 = StageAware) toggled from Tauri Tray.
     active_route_mode: AtomicU8,
-    /// Hot-updatable local inbound auth token (empty / None disables local auth).
-    local_auth_token: RwLock<Option<String>>,
+    /// Split inbound auth: `api_key` guards `/v1/*` and `/v1beta/*`; `admin_password` guards `/api/*`.
+    api_key: RwLock<Option<String>>,
+    admin_password: RwLock<Option<String>>,
+    /// Optional target path (typically `config.local.toml`) for atomic persistence of runtime GUI edits.
+    persist_config_path: RwLock<Option<PathBuf>>,
     http: Client,
 }
 
@@ -292,11 +316,8 @@ impl GatewayEngine {
         ));
         let signatures = Arc::new(SignatureCache::new(Duration::from_secs(3600)));
 
-        let initial_token = config
-            .server
-            .local_auth_token
-            .clone()
-            .filter(|s| !s.trim().is_empty());
+        let initial_api_key = config.server.effective_api_key();
+        let initial_admin_password = config.server.effective_admin_password();
 
         let rate_limiter = Arc::new(IngressRateLimitMiddleware::new(
             config.middleware.rpm_limit,
@@ -336,9 +357,250 @@ impl GatewayEngine {
             memory,
             mcp_bridge,
             active_route_mode: AtomicU8::new(mode_byte),
-            local_auth_token: RwLock::new(initial_token),
+            api_key: RwLock::new(initial_api_key),
+            admin_password: RwLock::new(initial_admin_password),
+            persist_config_path: RwLock::new(None),
             http,
         })
+    }
+
+    pub fn set_persist_config_path(&self, path: PathBuf) {
+        let mut g = self
+            .persist_config_path
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *g = Some(path);
+    }
+
+    fn persist_local_config(&self) -> Result<(), GatewayError> {
+        let maybe_path = self
+            .persist_config_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(path) = maybe_path else {
+            return Ok(());
+        };
+
+        let mut snapshot = self.config.clone();
+        snapshot.routing.default_mode = self.active_route_mode();
+        snapshot.server.api_key = self.api_key.read().unwrap_or_else(|e| e.into_inner()).clone();
+        snapshot.server.local_auth_token = snapshot.server.api_key.clone();
+        snapshot.server.admin_password = self
+            .admin_password
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        snapshot.channels = self.router.channel_configs();
+        snapshot.save_atomic(path)?;
+        Ok(())
+    }
+
+    pub fn list_channel_configs(&self) -> Vec<ChannelConfig> {
+        self.router.channel_configs()
+    }
+
+    /// Hot-updates or inserts a channel into the live P2C router (auto-normalizing `base_url`)
+    /// and atomically persists to `config.local.toml` when configured.
+    pub fn upsert_channel(&self, mut cfg: ChannelConfig) -> Result<ChannelSnapshot, GatewayError> {
+        cfg.normalize();
+        if cfg.id.is_empty() {
+            return Err(GatewayError::Config(ConfigError::Validation(
+                "channel id cannot be empty".into(),
+            )));
+        }
+        if cfg.base_url.is_empty() {
+            return Err(GatewayError::Config(ConfigError::Validation(
+                "channel base_url cannot be empty".into(),
+            )));
+        }
+        let snap = self.router.upsert_channel(cfg);
+        self.persist_local_config()?;
+        Ok(snap)
+    }
+
+    pub fn delete_channel(&self, id: &str) -> Result<bool, GatewayError> {
+        let removed = self.router.delete_channel(id);
+        if removed {
+            self.persist_local_config()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn set_channel_enabled(&self, id: &str, enabled: bool) -> Result<ChannelSnapshot, GatewayError> {
+        let snap = self
+            .router
+            .set_channel_enabled(id, enabled)
+            .ok_or_else(|| GatewayError::NoAvailableChannel(id.to_string()))?;
+        self.persist_local_config()?;
+        Ok(snap)
+    }
+
+    fn http_client_for_channel(&self, cfg: &ChannelConfig) -> Result<Client, GatewayError> {
+        let Some(ref proxy_url) = cfg.proxy_url else {
+            return Ok(self.http.clone());
+        };
+        let proxy = Proxy::all(proxy_url)
+            .map_err(|e| GatewayError::Transport(format!("invalid proxy_url '{}': {}", proxy_url, e)))?;
+        Client::builder()
+            .timeout(Duration::from_secs(self.config.server.request_timeout_secs))
+            .proxy(proxy)
+            .build()
+            .map_err(|e| GatewayError::Transport(e.to_string()))
+    }
+
+    /// Probes an upstream channel's reachability, latency (ms), and optional `quota_endpoint`.
+    pub async fn test_channel_connection(&self, mut cfg: ChannelConfig) -> ChannelTestResult {
+        cfg.normalize();
+        let probe_url = match cfg.protocol {
+            UpstreamProtocol::Gemini => format!("{}/v1beta/models", cfg.base_url),
+            UpstreamProtocol::Anthropic | UpstreamProtocol::OpenAi => {
+                format!("{}/v1/models", cfg.base_url)
+            }
+        };
+
+        let client = match cfg.proxy_url.as_deref() {
+            Some(proxy_url) => match Proxy::all(proxy_url) {
+                Ok(p) => match Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .proxy(p)
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return ChannelTestResult {
+                            ok: false,
+                            channel_id: cfg.id,
+                            status_code: None,
+                            latency_ms: 0,
+                            endpoint: probe_url,
+                            message: format!("proxy build error: {}", e),
+                            quota_info: None,
+                        };
+                    }
+                },
+                Err(e) => {
+                    return ChannelTestResult {
+                        ok: false,
+                        channel_id: cfg.id,
+                        status_code: None,
+                        latency_ms: 0,
+                        endpoint: probe_url,
+                        message: format!("invalid proxy_url: {}", e),
+                        quota_info: None,
+                    };
+                }
+            },
+            None => match Client::builder().timeout(Duration::from_secs(10)).build() {
+                Ok(c) => c,
+                Err(_) => self.http.clone(),
+            },
+        };
+
+        let started = Instant::now();
+        let mut req = client.get(&probe_url);
+        req = match cfg.protocol {
+            UpstreamProtocol::Anthropic => req
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01"),
+            UpstreamProtocol::OpenAi => req.bearer_auth(&cfg.api_key),
+            UpstreamProtocol::Gemini => req.header("x-goog-api-key", &cfg.api_key),
+        };
+
+        let (ok, status_code, message) = match req.send().await {
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                // Any non-5xx / reachable HTTP response proves connectivity; 2xx is healthy,
+                // 404 on /v1/models is common on minimal proxies so treat < 500 && != 401/403 as reachable.
+                let is_ok = (200..300).contains(&code) || code == 404 || code == 405;
+                let msg = if (200..300).contains(&code) {
+                    format!("HTTP {} OK", code)
+                } else if code == 401 || code == 403 {
+                    format!("HTTP {} Auth Failed (check api_key)", code)
+                } else if code == 404 || code == 405 {
+                    format!("HTTP {} Reachable (endpoint reachable, /models not exposed)", code)
+                } else {
+                    format!("HTTP {}", code)
+                };
+                (is_ok, Some(code), msg)
+            }
+            Err(e) => (false, None, format!("connection failed: {}", e)),
+        };
+        let latency_ms = started.elapsed().as_millis() as u64;
+
+        let quota_info = if let Some(ref q_url) = cfg.quota_endpoint {
+            let mut q_req = client.get(q_url);
+            q_req = match cfg.protocol {
+                UpstreamProtocol::Anthropic => q_req.header("x-api-key", &cfg.api_key),
+                UpstreamProtocol::OpenAi => q_req.bearer_auth(&cfg.api_key),
+                UpstreamProtocol::Gemini => q_req.header("x-goog-api-key", &cfg.api_key),
+            };
+            match q_req.send().await {
+                Ok(qr) if qr.status().is_success() => qr.json::<Value>().await.ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        ChannelTestResult {
+            ok,
+            channel_id: cfg.id,
+            status_code,
+            latency_ms,
+            endpoint: probe_url,
+            message,
+            quota_info,
+        }
+    }
+
+    /// Claude CLI / Anthropic preflight `POST /v1/messages/count_tokens`.
+    /// Forwards to upstream `/v1/messages/count_tokens` when routed to a native Anthropic channel
+    /// that supports it, falling back seamlessly to deterministic Canonical IR estimation so
+    /// Claude Code works transparently even when backed by OpenAI or Gemini upstreams.
+    pub async fn count_tokens(&self, payload: Value) -> Result<Value, GatewayError> {
+        let codec = codec_for(UpstreamProtocol::Anthropic);
+        let canonical = codec.decode_request(&payload, None, None)?;
+
+        if let Some(decision) =
+            self.router
+                .select_channel(&canonical, Some(self.active_route_mode()), &[])
+        {
+            if decision.channel.config.protocol == UpstreamProtocol::Anthropic {
+                let upstream_model = decision
+                    .channel
+                    .config
+                    .resolve_upstream_model(&decision.actual_model);
+                let mut body = payload.clone();
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("model".into(), json!(upstream_model));
+                    obj.remove("stream");
+                }
+                let url = format!("{}/v1/messages/count_tokens", decision.channel.config.base_url);
+                if let Ok(client) = self.http_client_for_channel(&decision.channel.config) {
+                    if let Ok(resp) = client
+                        .post(&url)
+                        .timeout(Duration::from_secs(5))
+                        .header("x-api-key", &decision.channel.config.api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .json(&body)
+                        .send()
+                        .await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(val) = resp.json::<Value>().await {
+                                if val.get("input_tokens").and_then(|v| v.as_u64()).is_some() {
+                                    return Ok(val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let estimated = estimate_canonical_input_tokens(&canonical);
+        Ok(json!({ "input_tokens": estimated }))
     }
 
     pub fn cloud_status(&self) -> CloudSessionStatus {
@@ -379,38 +641,78 @@ impl GatewayEngine {
         Arc::clone(&self.mcp_bridge)
     }
 
-    pub fn verify_inbound_auth(&self, provided_token: Option<&str>) -> bool {
-        let guard = self
-            .local_auth_token
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+    /// Verifies inference API key (`/v1/*`, `/v1beta/*`). Returns true when no `api_key` is set.
+    pub fn verify_api_auth(&self, provided_token: Option<&str>) -> bool {
+        let guard = self.api_key.read().unwrap_or_else(|e| e.into_inner());
         match guard.as_deref() {
             None | Some("") => true,
             Some(expected) => provided_token == Some(expected),
         }
     }
 
-    pub fn local_auth_token(&self) -> Option<String> {
-        self.local_auth_token
+    /// Legacy alias for `verify_api_auth`.
+    pub fn verify_inbound_auth(&self, provided_token: Option<&str>) -> bool {
+        self.verify_api_auth(provided_token)
+    }
+
+    /// Verifies management/admin password (`/api/*`, `/__admin/*`). Returns true when unset.
+    pub fn verify_admin_auth(&self, provided_password: Option<&str>) -> bool {
+        let guard = self
+            .admin_password
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_deref() {
+            None | Some("") => true,
+            Some(expected) => provided_password == Some(expected),
+        }
+    }
+
+    pub fn auth_settings(&self) -> AuthSettings {
+        AuthSettings {
+            api_key: self.api_key.read().unwrap_or_else(|e| e.into_inner()).clone(),
+            admin_password: self
+                .admin_password
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        }
+    }
+
+    pub fn set_auth_settings(
+        &self,
+        api_key: Option<String>,
+        admin_password: Option<String>,
+    ) -> Result<AuthSettings, GatewayError> {
+        let norm = |v: Option<String>| {
+            v.and_then(|s| {
+                let t = s.trim().to_string();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            })
+        };
+        *self.api_key.write().unwrap_or_else(|e| e.into_inner()) = norm(api_key);
+        *self
+            .admin_password
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = norm(admin_password);
+        self.persist_local_config()?;
+        Ok(self.auth_settings())
+    }
+
+    pub fn local_auth_token(&self) -> Option<String> {
+        self.api_key.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn set_local_auth_token(&self, token: Option<String>) {
-        let normalized = token.and_then(|s| {
-            let trimmed = s.trim().to_string();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        });
-        let mut guard = self
-            .local_auth_token
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        *guard = normalized;
+        let current_admin = self
+            .admin_password
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _ = self.set_auth_settings(token, current_admin);
     }
 
     pub fn format_error(
@@ -686,12 +988,13 @@ impl GatewayEngine {
                 canonical.stream,
             );
 
+            let channel_http = self.http_client_for_channel(&channel.config)?;
             let mut l1_attempt = 0u32;
             loop {
                 let started = Instant::now();
                 let inflight_guard = InflightGuard::enter(Arc::clone(&channel));
 
-                let mut req_builder = self.http.post(&endpoint).json(&encoded_body);
+                let mut req_builder = channel_http.post(&endpoint).json(&encoded_body);
                 req_builder = match channel.config.protocol {
                     UpstreamProtocol::Anthropic => req_builder
                         .header("x-api-key", &channel.config.api_key)
@@ -1113,7 +1416,7 @@ fn upstream_endpoint(
     upstream_model: &str,
     stream: bool,
 ) -> String {
-    let trimmed = base_url.trim_end_matches('/');
+    let trimmed = crate::config::normalize_base_url(base_url);
     match protocol {
         UpstreamProtocol::Anthropic => format!("{}/v1/messages", trimmed),
         UpstreamProtocol::OpenAi => format!("{}/v1/chat/completions", trimmed),
@@ -1128,6 +1431,44 @@ fn upstream_endpoint(
             }
         }
     }
+}
+
+/// Deterministic Canonical IR token estimator used by `/v1/messages/count_tokens` when upstream
+/// does not expose Anthropic's native count_tokens endpoint (e.g. OpenAI / Gemini upstreams).
+fn estimate_canonical_input_tokens(req: &CanonicalRequest) -> u64 {
+    let mut chars = 0usize;
+    let count_part = |p: &ContentPart| -> usize {
+        match p {
+            ContentPart::Text { text, .. } => text.len(),
+            ContentPart::Thinking { thinking, .. } => thinking.len(),
+            ContentPart::ToolCall {
+                name, arguments, ..
+            } => name.len() + serde_json::to_string(arguments).map(|s| s.len()).unwrap_or(0),
+            ContentPart::ToolResult { content, .. } => {
+                serde_json::to_string(content).map(|s| s.len()).unwrap_or(0)
+            }
+            ContentPart::Opaque { raw } => {
+                serde_json::to_string(raw).map(|s| s.len()).unwrap_or(0)
+            }
+        }
+    };
+    for p in &req.system {
+        chars += count_part(p);
+    }
+    for m in &req.messages {
+        chars += 12; // per-message framing overhead
+        for p in &m.parts {
+            chars += count_part(p);
+        }
+    }
+    for t in &req.tools {
+        chars += t.name.len()
+            + t.description.as_deref().map(str::len).unwrap_or(0)
+            + serde_json::to_string(&t.parameters)
+                .map(|s| s.len())
+                .unwrap_or(0);
+    }
+    ((chars as u64) / 4).max(1)
 }
 
 #[cfg(test)]

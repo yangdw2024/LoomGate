@@ -10,6 +10,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("failed to parse TOML config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("failed to serialize TOML config: {0}")]
+    Serialize(#[from] toml::ser::Error),
     #[error("invalid configuration: {0}")]
     Validation(String),
 }
@@ -86,10 +88,17 @@ pub struct ServerConfig {
     pub bind_addr: String,
     #[serde(default = "default_timeout_secs")]
     pub request_timeout_secs: u64,
-    /// Optional local bearer/x-api-key token required for inbound requests.
-    /// Empty or omitted disables inbound auth (local dev default).
-    #[serde(default)]
+    /// Legacy alias for `api_key` (retained for backward compatibility).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_auth_token: Option<String>,
+    /// API key required for inference endpoints (`/v1/*`, `/v1beta/*`).
+    /// Empty or omitted disables inference auth (passwordless localhost dev mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Admin password required for control/management endpoints (`/api/*`, `/__admin/*`).
+    /// Empty or omitted disables admin auth (passwordless localhost dev mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_password: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -98,7 +107,28 @@ impl Default for ServerConfig {
             bind_addr: default_bind_addr(),
             request_timeout_secs: default_timeout_secs(),
             local_auth_token: None,
+            api_key: None,
+            admin_password: None,
         }
+    }
+}
+
+impl ServerConfig {
+    pub fn effective_api_key(&self) -> Option<String> {
+        self.api_key
+            .as_deref()
+            .or(self.local_auth_token.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+
+    pub fn effective_admin_password(&self) -> Option<String> {
+        self.admin_password
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
     }
 }
 
@@ -211,18 +241,67 @@ pub struct ChannelConfig {
     pub api_key: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    #[serde(default = "default_channel_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub models: Vec<String>,
     /// Optional model alias map: requested_model -> upstream_model
     #[serde(default)]
     pub model_map: HashMap<String, String>,
+    /// Optional per-channel HTTP/HTTPS/SOCKS5 proxy URL (e.g. "socks5h://127.0.0.1:1080").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// Optional explicit fallback model chain (used in Stage-Aware mode when primary model is unavailable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
+    /// Optional upstream quota / balance probe endpoint URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_endpoint: Option<String>,
 }
 
 fn default_weight() -> u32 {
     100
 }
 
+fn default_channel_enabled() -> bool {
+    true
+}
+
+/// Normalizes an upstream `base_url` by trimming whitespace/slashes and stripping redundant
+/// trailing `/v1` or `/v1beta` segments so downstream endpoint joining never produces `/v1/v1/...`.
+pub fn normalize_base_url(url: &str) -> String {
+    let mut s = url.trim().trim_end_matches('/').to_string();
+    loop {
+        if let Some(stripped) = s.strip_suffix("/v1") {
+            s = stripped.trim_end_matches('/').to_string();
+        } else if let Some(stripped) = s.strip_suffix("/v1beta") {
+            s = stripped.trim_end_matches('/').to_string();
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 impl ChannelConfig {
+    pub fn normalize(&mut self) {
+        self.id = self.id.trim().to_string();
+        self.base_url = normalize_base_url(&self.base_url);
+        self.proxy_url = self
+            .proxy_url
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self.quota_endpoint = self
+            .quota_endpoint
+            .take()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if self.weight == 0 {
+            self.weight = default_weight();
+        }
+    }
+
     pub fn supports_model(&self, model: &str) -> bool {
         if self.models.is_empty() || self.model_map.contains_key(model) {
             return true;
@@ -244,9 +323,27 @@ impl ChannelConfig {
 impl GatewayConfig {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let raw = std::fs::read_to_string(path)?;
-        let cfg: Self = toml::from_str(&raw)?;
+        let mut cfg: Self = toml::from_str(&raw)?;
+        for ch in &mut cfg.channels {
+            ch.normalize();
+        }
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Atomically persists the full configuration to `path` via sibling temp file + rename.
+    pub fn save_atomic(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        let target = path.as_ref();
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let body = toml::to_string_pretty(self)?;
+        let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, body.as_bytes())?;
+        std::fs::rename(&tmp, target)?;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -314,5 +411,49 @@ models = ["gpt-4o-mini"]
         let cfg: GatewayConfig = toml::from_str(raw).unwrap();
         assert_eq!(cfg.channels[0].protocol, UpstreamProtocol::OpenAi);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn normalizes_trailing_v1_and_v1beta_and_persists_atomically() {
+        assert_eq!(normalize_base_url("https://api.openai.com/v1/"), "https://api.openai.com");
+        assert_eq!(normalize_base_url("https://api.openai.com/v1/v1"), "https://api.openai.com");
+        assert_eq!(
+            normalize_base_url("https://generativelanguage.googleapis.com/v1beta/"),
+            "https://generativelanguage.googleapis.com"
+        );
+
+        let mut cfg = GatewayConfig {
+            server: ServerConfig {
+                api_key: Some("lg_api".into()),
+                admin_password: Some("lg_admin".into()),
+                ..Default::default()
+            },
+            routing: Default::default(),
+            error_governance: Default::default(),
+            middleware: Default::default(),
+            channels: vec![ChannelConfig {
+                id: "ch1".into(),
+                protocol: UpstreamProtocol::OpenAi,
+                base_url: "https://api.openai.com/v1/".into(),
+                api_key: "sk-test".into(),
+                weight: 100,
+                enabled: true,
+                models: vec!["gpt-4o".into()],
+                model_map: Default::default(),
+                proxy_url: Some("socks5h://127.0.0.1:1080".into()),
+                fallback_models: vec!["gpt-4o-mini".into()],
+                quota_endpoint: Some("https://api.openai.com/dashboard/billing/usage".into()),
+            }],
+        };
+        cfg.channels[0].normalize();
+        assert_eq!(cfg.channels[0].base_url, "https://api.openai.com");
+
+        let tmp = std::env::temp_dir().join(format!("lg_cfg_save_{}.toml", std::process::id()));
+        cfg.save_atomic(&tmp).unwrap();
+        let reloaded = GatewayConfig::from_file(&tmp).unwrap();
+        assert_eq!(reloaded.server.effective_api_key().as_deref(), Some("lg_api"));
+        assert_eq!(reloaded.server.effective_admin_password().as_deref(), Some("lg_admin"));
+        assert_eq!(reloaded.channels[0].proxy_url.as_deref(), Some("socks5h://127.0.0.1:1080"));
+        let _ = std::fs::remove_file(&tmp);
     }
 }
