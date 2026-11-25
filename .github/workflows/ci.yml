@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-and-conformance:
+    name: Rust Clippy, Unit Tests & 14/14 Conformance
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux Tauri v2 system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libxdo-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Cargo clippy (workspace, all targets, -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo test (workspace)
+        run: cargo test --workspace
+
+      - name: Build daemon & cloud control plane for conformance suite
+        run: cargo build -p gateway-daemon -p cloud-control-plane
+
+      - name: Run 14/14 End-to-End Conformance Suite
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, sys, time, urllib.request
+
+          env = os.environ.copy()
+          env["GATEWAY_CONFIG"] = os.path.abspath("config.example.toml")
+          env["GATEWAY_DB_PATH"] = "/tmp/loomgate-ci-trajectory.db"
+          env["GATEWAY_PERSIST_CONFIG"] = "/tmp/loomgate-ci-persist.toml"
+
+          mock = subprocess.Popen([sys.executable, "tests/mock_upstream.py"])
+          cloud = subprocess.Popen(["./target/debug/cloud-control-plane"], env=env)
+          daemon = subprocess.Popen(["./target/debug/gateway-daemon"], env=env)
+          try:
+              for url in [
+                  "http://127.0.0.1:18081/__admin/stats",
+                  "http://127.0.0.1:18084/__admin/stats",
+                  "http://127.0.0.1:8790/healthz",
+                  "http://127.0.0.1:8787/healthz",
+              ]:
+                  ok = False
+                  for _ in range(60):
+                      try:
+                          with urllib.request.urlopen(url, timeout=1) as r:
+                              if r.status == 200:
+                                  ok = True
+                                  break
+                      except Exception:
+                          time.sleep(0.25)
+                  if not ok:
+                      raise SystemExit(f"TIMEOUT waiting for {url}")
+              res = subprocess.run([sys.executable, "tests/conformance_suite.py"])
+              sys.exit(res.returncode)
+          finally:
+              for p in (daemon, cloud, mock):
+                  p.terminate()
+                  try:
+                      p.wait(timeout=5)
+                  except Exception:
+                      p.kill()
+          PY
+
+  frontend-and-sdk:
+    name: Desktop Frontend Build & npm SDK Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build Tauri React/Vite Desktop Frontend
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run build
+
+      - name: Test official loomgate npm SDK & CLI
+        working-directory: packages/loomgate
+        run: |
+          npm test
+          node bin/loomgate.mjs --help
+          npm pack --dry-run

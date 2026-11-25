@@ -2,7 +2,7 @@
 import { LoomGateClient } from "../dist/index.js";
 
 function usage() {
-  console.log(`LoomGate CLI v0.3.0 — Edge-Cloud Hybrid Microkernel AI Gateway
+  console.log(`LoomGate CLI v0.4.0 — Edge-Cloud Hybrid Microkernel AI Gateway
 
 Usage:
   loomgate status                                Show health, channels, middleware & cloud status
