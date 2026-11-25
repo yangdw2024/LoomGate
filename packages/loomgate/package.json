@@ -12,7 +12,7 @@
     }
   },
   "bin": {
-    "loomgate": "./bin/loomgate.mjs"
+    "loomgate": "bin/loomgate.mjs"
   },
   "files": [
     "dist",
@@ -38,7 +38,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yangdw2024/LoomGate.git"
+    "url": "git+https://github.com/yangdw2024/LoomGate.git"
   },
   "homepage": "https://github.com/yangdw2024/LoomGate#readme",
   "bugs": {
