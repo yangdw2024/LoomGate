@@ -42,10 +42,21 @@ jobs:
       - name: Cargo test (workspace)
         run: cargo test --workspace
 
+      - name: Setup Node.js 22 & build Web Console dist for E2E hosting check
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build Web Console static bundle
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run build
+
       - name: Build daemon & cloud control plane for conformance suite
         run: cargo build -p gateway-daemon -p cloud-control-plane
 
-      - name: Run 14/14 End-to-End Conformance Suite
+      - name: Run 18/18 End-to-End Conformance Suite
         run: |
           python3 - <<'PY'
           import os, subprocess, sys, time, urllib.request
@@ -54,6 +65,7 @@ jobs:
           env["GATEWAY_CONFIG"] = os.path.abspath("config.example.toml")
           env["GATEWAY_DB_PATH"] = "/tmp/loomgate-ci-trajectory.db"
           env["GATEWAY_PERSIST_CONFIG"] = "/tmp/loomgate-ci-persist.toml"
+          env["LOOMGATE_WEB_DIST"] = os.path.abspath("apps/desktop/dist")
 
           mock = subprocess.Popen([sys.executable, "tests/mock_upstream.py"])
           cloud = subprocess.Popen(["./target/debug/cloud-control-plane"], env=env)

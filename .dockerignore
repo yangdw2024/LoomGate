@@ -1,0 +1,12 @@
+target/
+apps/desktop/node_modules/
+apps/desktop/dist/
+.edge-gateway/
+.runtime/
+.tmp/
+.git/
+config.local.toml
+*.db
+*.db-shm
+*.db-wal
+__pycache__/

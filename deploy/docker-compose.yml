@@ -1,0 +1,42 @@
+# LoomGate v1.0.0 — One-Command Team Gateway + Web Console Deployment
+# Usage:
+#   docker compose -f deploy/docker-compose.yml up -d
+#   Open http://localhost:8787 for the Web Control Studio
+#   Point Claude Code / Cursor / Codex / Gemini CLI / SDKs to http://localhost:8787
+
+services:
+  loomgate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: loomgate:latest
+    container_name: loomgate-gateway
+    restart: unless-stopped
+    ports:
+      - "${LOOMGATE_PORT:-8787}:8787"
+    environment:
+      GATEWAY_BIND_ADDR: "0.0.0.0:8787"
+      GATEWAY_CONFIG: "${GATEWAY_CONFIG:-/app/config.example.toml}"
+      GATEWAY_PERSIST_CONFIG: "/data/config.local.toml"
+      GATEWAY_DB_PATH: "/data/trajectory.db"
+      LOOMGATE_WEB_DIST: "/app/web-dist"
+      RUST_LOG: "${RUST_LOG:-gateway_daemon=info,gateway_core=info}"
+    volumes:
+      - loomgate_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  cloud-control-plane:
+    image: loomgate:latest
+    container_name: loomgate-cloud-control-plane
+    restart: unless-stopped
+    profiles: ["cloud"]
+    entrypoint: ["/usr/local/bin/cloud-control-plane"]
+    ports:
+      - "${LOOMGATE_CLOUD_PORT:-8790}:8790"
+    environment:
+      CLOUD_BIND_ADDR: "0.0.0.0:8790"
+      RUST_LOG: "cloud_control_plane=info"
+
+volumes:
+  loomgate_data:

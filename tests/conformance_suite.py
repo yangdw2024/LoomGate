@@ -879,6 +879,59 @@ def test_17_trajectory_studio_fork_diff_markdown_export_redacts_secrets():
         srv.server_close()
 
 
+def test_18_web_console_static_hosting_and_browser_http_api():
+    reset_all()
+    # 18a. Verify /healthz reports web_console_enabled=True when LOOMGATE_WEB_DIST is mounted
+    st_h, _, health = http_json("GET", f"{GATEWAY}/healthz")
+    assert st_h == 200 and health.get("web_console_enabled") is True, f"web console not enabled: {health}"
+
+    # 18b. Verify GET / serves HTML Web Console and path traversal is blocked
+    with urllib.request.urlopen(f"{GATEWAY}/", timeout=5) as resp:
+        html = resp.read().decode("utf-8")
+        ct = resp.headers.get("Content-Type", "")
+        assert resp.status == 200 and "text/html" in ct, f"unexpected root response: {resp.status} {ct}"
+        assert 'id="root"' in html, "missing React root mount in served index.html"
+
+    # API 404 must stay JSON, never masked by SPA index.html
+    st_404, _, body_404 = http_json("GET", f"{GATEWAY}/api/does-not-exist-xyz")
+    assert st_404 == 404 and "error" in body_404, f"expected JSON 404 for unknown /api route: {st_404} {body_404}"
+
+    # 18c. Browser REST API parity: /api/status + hot-switch /api/route-mode
+    st_s, _, status_body = http_json("GET", f"{GATEWAY}/api/status")
+    assert st_s == 200 and "channels" in status_body and status_body["route_mode"] == "lock"
+
+    st_sw, _, sw_body = http_json("POST", f"{GATEWAY}/api/route-mode", {"mode": "stage_aware"})
+    assert st_sw == 200 and sw_body["mode"] == "stage_aware"
+    _, _, status_after = http_json("GET", f"{GATEWAY}/api/status")
+    assert status_after["route_mode"] == "stage_aware"
+    http_json("POST", f"{GATEWAY}/api/route-mode", {"mode": "lock"})
+
+    # 18d. Web admin_password enforcement on /api/status (401 without header -> 200 with x-admin-password)
+    web_pw = "lg_web_console_pw"
+    st_set, _, _ = http_json(
+        "POST",
+        f"{GATEWAY}/api/auth/settings",
+        {"api_key": None, "admin_password": web_pw},
+    )
+    assert st_set == 200
+    try:
+        st_deny, _, _ = http_json("GET", f"{GATEWAY}/api/status")
+        assert st_deny == 401, f"expected 401 on /api/status without x-admin-password, got {st_deny}"
+
+        st_allow, _, _ = http_json(
+            "GET", f"{GATEWAY}/api/status", headers={"x-admin-password": web_pw}
+        )
+        assert st_allow == 200, f"expected 200 with x-admin-password, got {st_allow}"
+        return "Web Console / served HTML, /api 404 stays JSON, /api/route-mode & x-admin-password verified"
+    finally:
+        http_json(
+            "POST",
+            f"{GATEWAY}/api/auth/settings",
+            {"api_key": None, "admin_password": None},
+            headers={"x-admin-password": web_pw},
+        )
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -898,6 +951,7 @@ if __name__ == "__main__":
         ("15. v0.5.0 Local Model Auto-Discovery, Import & Offline Fallback", test_15_local_model_discovery_import_and_offline_fallback),
         ("16. v0.5.0 Local Savings & Stop-Loss Telemetry Dashboard", test_16_local_savings_and_stop_loss_analytics),
         ("17. v0.5.0 Trajectory Studio Fork/Diff Markdown Export & Redaction", test_17_trajectory_studio_fork_diff_markdown_export_redacts_secrets),
+        ("18. v1.0.0 Web Console Static Hosting & Browser HTTP API Auth", test_18_web_console_static_hosting_and_browser_http_api),
     ]
     failed = 0
     for name, fn in tests:

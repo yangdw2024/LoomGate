@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -14,7 +14,7 @@ use gateway_core::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Component, Path as StdPath, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -22,6 +22,13 @@ use tracing::{error, info};
 struct AppState {
     engine: Arc<GatewayEngine>,
     takeover: Arc<CliTakeoverManager>,
+    bind_addr: String,
+    web_dist: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct SetRouteModeRequest {
+    mode: String,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +138,42 @@ fn resolve_persist_path(loaded_config_path: &str) -> PathBuf {
     }
 }
 
+fn parse_cli_args() -> (String, Option<PathBuf>) {
+    let mut config_arg: Option<String> = None;
+    let mut web_dist_arg: Option<PathBuf> = None;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--web-dist" {
+            if let Some(val) = args.next() {
+                if !val.trim().is_empty() {
+                    web_dist_arg = Some(PathBuf::from(val));
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix("--web-dist=") {
+            if !val.trim().is_empty() {
+                web_dist_arg = Some(PathBuf::from(val));
+            }
+        } else if !arg.starts_with('-') && config_arg.is_none() {
+            config_arg = Some(arg);
+        }
+    }
+
+    let config_path = config_arg
+        .or_else(|| std::env::var("GATEWAY_CONFIG").ok())
+        .unwrap_or_else(|| "config.example.toml".to_string());
+
+    let web_dist = web_dist_arg.or_else(|| {
+        std::env::var("LOOMGATE_WEB_DIST")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+
+    (config_path, web_dist)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -140,15 +183,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("GATEWAY_CONFIG").ok())
-        .unwrap_or_else(|| "config.example.toml".to_string());
+    let (config_path, raw_web_dist) = parse_cli_args();
+    let web_dist = raw_web_dist.and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
 
     let db_path = std::env::var("GATEWAY_DB_PATH")
         .unwrap_or_else(|_| ".edge-gateway/trajectory.db".to_string());
 
-    let config = GatewayConfig::from_file(&config_path)?;
+    let mut config = GatewayConfig::from_file(&config_path)?;
+    if let Ok(override_bind) = std::env::var("GATEWAY_BIND_ADDR") {
+        if !override_bind.trim().is_empty() {
+            config.server.bind_addr = override_bind.trim().to_string();
+        }
+    }
     let bind_addr = config.server.bind_addr.clone();
     let gateway_url = format!("http://{}", bind_addr);
     let engine = Arc::new(GatewayEngine::new_with_sqlite(config, &db_path)?);
@@ -158,10 +204,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CliTakeoverManager::new(gateway_url)
             .unwrap_or_else(|_| CliTakeoverManager::with_home_dir(PathBuf::from("."), "http://127.0.0.1:8787")),
     );
-    let state = AppState { engine, takeover };
+    let state = AppState {
+        engine,
+        takeover,
+        bind_addr: bind_addr.clone(),
+        web_dist: web_dist.clone(),
+    };
 
     let admin_routes = Router::new()
         .route("/__admin/reset", post(admin_reset))
+        .route("/api/status", get(api_status))
+        .route("/api/route-mode", post(set_route_mode))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:session_id/steps", get(get_session_steps))
         .route("/api/steps/:step_id/fork", post(fork_step))
@@ -180,24 +233,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/local/import", post(local_import))
         .route("/api/analytics/savings", get(analytics_savings))
         .route("/api/clients", get(list_clients))
+        .route("/api/clients/:id/takeover", post(takeover_client))
+        .route("/api/clients/:id/restore", post(restore_client))
         .route("/api/auth/settings", get(get_auth_settings).post(set_auth_settings))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_auth,
         ));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics/channels", get(channel_metrics))
         .route("/v1/messages", post(handle_anthropic))
         .route("/v1/messages/count_tokens", post(handle_anthropic_count_tokens))
         .route("/v1/chat/completions", post(handle_openai))
         .route("/v1beta/models/:model_action", post(handle_gemini))
-        .merge(admin_routes)
-        .with_state(state);
+        .merge(admin_routes);
+
+    if web_dist.is_some() {
+        app = app.fallback(serve_web_dist);
+    }
+    let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!(bind_addr = %bind_addr, db = %db_path, "LoomGate local daemon listening (v0.5.0)");
+    info!(
+        bind_addr = %bind_addr,
+        db = %db_path,
+        web_dist = ?web_dist,
+        "LoomGate local daemon listening (v1.0.0)"
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -207,10 +271,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
-        "version": "0.5.0",
+        "version": "1.0.0",
         "kernel": "gateway-core",
-        "route_mode": format!("{:?}", state.engine.active_route_mode()).to_lowercase()
+        "bind_addr": state.bind_addr,
+        "route_mode": match state.engine.active_route_mode() {
+            RouteMode::Lock => "lock",
+            RouteMode::StageAware => "stage_aware",
+        },
+        "admin_auth_required": state.engine.auth_settings().admin_password.is_some(),
+        "web_console_enabled": state.web_dist.is_some(),
     }))
+}
+
+async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "bind_addr": state.bind_addr,
+        "route_mode": match state.engine.active_route_mode() {
+            RouteMode::Lock => "lock",
+            RouteMode::StageAware => "stage_aware",
+        },
+        "channels": state.engine.channel_snapshots(),
+    }))
+}
+
+async fn set_route_mode(
+    State(state): State<AppState>,
+    Json(req): Json<SetRouteModeRequest>,
+) -> impl IntoResponse {
+    let parsed = match req.mode.as_str() {
+        "lock" => RouteMode::Lock,
+        "stage_aware" => RouteMode::StageAware,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": format!("unsupported route mode: {}", other) })),
+            )
+                .into_response();
+        }
+    };
+    state.engine.set_route_mode(parsed);
+    Json(json!({ "ok": true, "mode": req.mode })).into_response()
 }
 
 async fn channel_metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -327,6 +427,36 @@ async fn list_clients(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "profiles": state.takeover.list_profiles(api_key.as_deref())
     }))
+}
+
+async fn takeover_client(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let api_key = state.engine.auth_settings().api_key;
+    match state.takeover.takeover_by_id(&id, api_key.as_deref()) {
+        Ok(profile) => Json(json!({ "ok": true, "profile": profile })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn restore_client(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let api_key = state.engine.auth_settings().api_key;
+    match state.takeover.restore_by_id(&id, api_key.as_deref()) {
+        Ok(profile) => Json(json!({ "ok": true, "profile": profile })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_auth_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -698,7 +828,115 @@ async fn dispatch(
     }
 }
 
+fn guess_mime_type(path: &StdPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        _ => "application/octet-stream",
+    }
+}
+
+fn resolve_safe_static_path(root: &StdPath, req_path: &str) -> Option<PathBuf> {
+    let rel = req_path.trim_start_matches('/');
+    let mut candidate = root.to_path_buf();
+    for comp in StdPath::new(rel).components() {
+        match comp {
+            Component::Normal(seg) => candidate.push(seg),
+            Component::CurDir => {}
+            _ => return None, // Reject `..`, root dir, Windows drive prefixes
+        }
+    }
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+async fn serve_web_dist(State(state): State<AppState>, uri: Uri) -> Response {
+    let path = uri.path();
+    // Never mask API / protocol 404s with SPA index.html
+    if path.starts_with("/v1/")
+        || path.starts_with("/v1beta/")
+        || path.starts_with("/api/")
+        || path.starts_with("/__admin/")
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("endpoint not found: {}", path) })),
+        )
+            .into_response();
+    }
+
+    let Some(ref root) = state.web_dist else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let target = if path == "/" || path.is_empty() {
+        Some(root.join("index.html"))
+    } else {
+        resolve_safe_static_path(root, path).or_else(|| {
+            // SPA fallback only for extensionless navigation routes
+            if !path.rsplit('/').next().unwrap_or("").contains('.') {
+                Some(root.join("index.html"))
+            } else {
+                None
+            }
+        })
+    };
+
+    let Some(file_path) = target else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match tokio::fs::read(&file_path).await {
+        Ok(bytes) => {
+            let mime = guess_mime_type(&file_path);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", mime)
+                .header("cache-control", "no-cache")
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     info!("received Ctrl+C, shutting down LoomGate daemon cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_path_resolver_blocks_traversal_and_resolves_assets() {
+        let dir = std::env::temp_dir().join(format!("lg_web_dist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>ok</html>").unwrap();
+        std::fs::write(dir.join("assets/app.js"), "console.log(1)").unwrap();
+
+        assert!(resolve_safe_static_path(&dir, "/../Cargo.toml").is_none());
+        assert!(resolve_safe_static_path(&dir, "/assets/../../secret").is_none());
+        let js = resolve_safe_static_path(&dir, "/assets/app.js").unwrap();
+        assert_eq!(guess_mime_type(&js), "application/javascript; charset=utf-8");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

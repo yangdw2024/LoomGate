@@ -1,173 +1,25 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import {
+  AdminAuthRequiredError,
+  AuthSettings,
+  ChannelConfig,
+  ChannelSnapshot,
+  ChannelTestResult,
+  ClientProfileStatus,
+  CloudSessionStatus,
+  DiscoveredLocalProvider,
+  ForkDiffExport,
+  ForkDiffResult,
+  SavingsSummary,
+  SessionSummary,
+  TrajectoryStep,
+  clearSessionAdminPassword,
+  gatewayClient,
+  getSessionAdminPassword,
+  setSessionAdminPassword,
+} from "./api/client";
 
 type TabId = "channels" | "takeover" | "trajectory" | "savings";
-
-interface ChannelSnapshot {
-  id: string;
-  protocol: string;
-  base_url: string;
-  enabled: boolean;
-  weight: number;
-  models: string[];
-  proxy_url: string | null;
-  fallback_models: string[];
-  quota_endpoint: string | null;
-  offline_fallback: boolean;
-  health: "healthy" | "cooldown" | "quarantined";
-  cooldown_remaining_secs: number;
-  quarantine_remaining_secs: number;
-  inflight: number;
-  ewma_ttft_ms: number | null;
-  total_requests: number;
-}
-
-interface ChannelConfig {
-  id: string;
-  protocol: "anthropic" | "openai" | "gemini";
-  base_url: string;
-  api_key: string;
-  weight: number;
-  enabled: boolean;
-  models: string[];
-  model_map: Record<string, string>;
-  proxy_url?: string | null;
-  fallback_models: string[];
-  quota_endpoint?: string | null;
-  offline_fallback: boolean;
-}
-
-interface DiscoveredLocalProvider {
-  kind: "ollama" | "lm_studio" | "vllm" | "custom_openai";
-  display_name: string;
-  suggested_channel_id: string;
-  base_url: string;
-  port: number;
-  models: string[];
-  latency_ms: number;
-}
-
-interface ModelSavingsRow {
-  model: string;
-  requests: number;
-  input_tokens: number;
-  cache_read_tokens: number;
-  output_tokens: number;
-  cache_hit_ratio: number;
-  aborted_count: number;
-  estimated_actual_cost_usd: number;
-  estimated_cache_savings_usd: number;
-}
-
-interface SavingsSummary {
-  window_days: number;
-  total_requests: number;
-  completed_requests: number;
-  aborted_by_client_count: number;
-  sticky_hit_count: number;
-  total_input_tokens: number;
-  total_cache_read_tokens: number;
-  total_output_tokens: number;
-  avg_cache_hit_ratio: number;
-  estimated_actual_cost_usd: number;
-  estimated_cache_savings_usd: number;
-  estimated_stop_loss_savings_usd: number;
-  by_model: ModelSavingsRow[];
-}
-
-interface ChannelTestResult {
-  ok: boolean;
-  channel_id: string;
-  status_code: number | null;
-  latency_ms: number;
-  endpoint: string;
-  message: string;
-  quota_info?: unknown;
-}
-
-interface AuthSettings {
-  api_key: string | null;
-  admin_password: string | null;
-}
-
-interface ClientProfileStatus {
-  id: string;
-  display_name: string;
-  category: string;
-  kind: "atomic_takeover" | "setup_wizard";
-  description: string;
-  custom: boolean;
-  config_path: string | null;
-  installed: boolean;
-  taken_over: boolean;
-  has_backup: boolean;
-  active_endpoint: string | null;
-  wizard_endpoint: string | null;
-  wizard_protocol: string | null;
-  env_snippet: string | null;
-  config_snippet: string | null;
-  instructions: string[];
-}
-
-interface SessionSummary {
-  session_id: string;
-  workspace: string;
-  step_count: number;
-  fork_count: number;
-  total_cache_read_tokens: number;
-  total_input_tokens: number;
-  last_model: string;
-  updated_at_ms: number;
-}
-
-interface TrajectoryStep {
-  step_id: string;
-  session_id: string;
-  parent_step_id: string | null;
-  turn_index: number;
-  channel_id: string;
-  actual_model: string;
-  route_mode: string;
-  sticky_hit: boolean;
-  ttft_ms: number;
-  input_tokens: number;
-  cache_read_tokens: number;
-  output_tokens: number;
-  status: string;
-  response_text: string;
-}
-
-interface ForkDiffResult {
-  original: TrajectoryStep;
-  forked: TrajectoryStep;
-  ttft_delta_ms: number;
-  output_tokens_delta: number;
-  cache_hit_ratio_delta: number;
-}
-
-interface ForkDiffExport {
-  original_step_id: string;
-  forked_step_id: string;
-  original_model: string;
-  forked_model: string;
-  redacted: boolean;
-  redactions_applied: number;
-  sanitized_original_text: string;
-  sanitized_forked_text: string;
-  markdown: string;
-}
-
-interface CloudSessionStatus {
-  connected: boolean;
-  control_plane_url: string | null;
-  email: string | null;
-  tenant_id: string | null;
-  synced_channels: number;
-  available_micros: number | null;
-  telemetry_uploaded: number;
-  last_sync_ms: number | null;
-}
 
 interface DiffLine {
   kind: "same" | "del" | "add";
@@ -386,7 +238,7 @@ function triggerDownload(filename: string, href: string) {
   document.body.removeChild(a);
 }
 
-const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const isDesktop = () => gatewayClient.isTauri();
 
 const emptyChannelForm = () => ({
   id: "",
@@ -443,81 +295,123 @@ export default function App() {
   const [cloudUrl, setCloudUrl] = useState("http://127.0.0.1:8790");
   const [cloudEmail, setCloudEmail] = useState("dev@loomgate.dev");
   const [cloudPassword, setCloudPassword] = useState("loomgate-dev-password");
+  const [adminAuthLocked, setAdminAuthLocked] = useState<boolean>(false);
+  const [webAdminPrompt, setWebAdminPrompt] = useState<string>("");
   const [notice, setNotice] = useState<string>("");
 
+  function handleApiError(e: unknown, prefix?: string) {
+    if (e instanceof AdminAuthRequiredError) {
+      setAdminAuthLocked(true);
+      setNotice("Web Console requires Admin Password (stored only in browser sessionStorage).");
+      return;
+    }
+    setNotice(prefix ? `${prefix}: ${String(e)}` : String(e));
+  }
+
   async function refreshAll() {
-    if (!isTauri()) return;
-    const status = await invoke<{
-      bind_addr: string;
-      route_mode: "lock" | "stage_aware";
-      channels: ChannelSnapshot[];
-    }>("get_gateway_status");
-    setBindAddr(status.bind_addr);
-    setRouteMode(status.route_mode);
-    setChannels(status.channels);
+    try {
+      const status = await gatewayClient.getGatewayStatus();
+      setBindAddr(status.bind_addr);
+      setRouteMode(status.route_mode);
+      setChannels(status.channels);
 
-    const cfgList = await invoke<ChannelConfig[]>("list_channel_configs");
-    setChannelConfigs(cfgList);
-
-    const profList = await invoke<ClientProfileStatus[]>("list_client_profiles");
-    setProfiles(profList);
-
-    const cloud = await invoke<CloudSessionStatus>("get_cloud_status");
-    setCloudStatus(cloud);
-
-    const sessList = await invoke<SessionSummary[]>("list_sessions");
-    setSessions(sessList);
-    const sav = await invoke<SavingsSummary>("get_savings_summary", { days: savingsDays });
-    setSavings(sav);
-    if (selectedSession) {
-      const st = await invoke<TrajectoryStep[]>("get_session_steps", {
-        sessionId: selectedSession,
-      });
-      setSteps(st);
+      const [cfgList, profList, cloud, sessList, sav] = await Promise.all([
+        gatewayClient.listChannelConfigs(),
+        gatewayClient.listClientProfiles(),
+        gatewayClient.getCloudStatus(),
+        gatewayClient.listSessions(),
+        gatewayClient.getSavingsSummary(savingsDays),
+      ]);
+      setAdminAuthLocked(false);
+      setChannelConfigs(cfgList);
+      setProfiles(profList);
+      setCloudStatus(cloud);
+      setSessions(sessList);
+      setSavings(sav);
+      if (selectedSession) {
+        const st = await gatewayClient.getSessionSteps(selectedSession);
+        setSteps(st);
+      }
+    } catch (e) {
+      if (e instanceof AdminAuthRequiredError) {
+        setAdminAuthLocked(true);
+        return;
+      }
+      throw e;
     }
   }
 
   useEffect(() => {
-    if (!isTauri()) return;
-    invoke<boolean>("get_autostart_enabled")
+    gatewayClient
+      .getAutostartEnabled()
       .then(setAutostart)
       .catch(() => {});
-    invoke<AuthSettings>("get_auth_settings")
+    gatewayClient
+      .getAuthSettings()
       .then((auth) => {
         setActiveAuth(auth);
         setApiKeyInput(auth.api_key ?? "");
         setAdminPasswordInput(auth.admin_password ?? "");
       })
-      .catch(() => {});
+      .catch((e) => {
+        if (e instanceof AdminAuthRequiredError) {
+          setAdminAuthLocked(true);
+        }
+      });
   }, []);
 
   useEffect(() => {
-    refreshAll().catch((e) => setNotice(String(e)));
+    refreshAll().catch((e) => handleApiError(e));
     const timer = setInterval(() => {
       refreshAll().catch(() => {});
     }, 2000);
     let unlisten: (() => void) | undefined;
-    if (isTauri()) {
-      listen<"lock" | "stage_aware">("route-mode-changed", (event) => {
-        setRouteMode(event.payload);
-        setNotice(`Tray hot-switched route mode to ${event.payload}`);
+    gatewayClient
+      .onRouteModeChanged((mode) => {
+        setRouteMode(mode);
+        setNotice(`Tray hot-switched route mode to ${mode}`);
       })
-        .then((fn) => {
-          unlisten = fn;
-        })
-        .catch(() => {});
-    }
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
     return () => {
       clearInterval(timer);
       if (unlisten) unlisten();
     };
   }, [selectedSession, savingsDays]);
 
+  async function handleUnlockWebAdmin() {
+    setSessionAdminPassword(webAdminPrompt);
+    setWebAdminPrompt("");
+    try {
+      await refreshAll();
+      const auth = await gatewayClient.getAuthSettings();
+      setActiveAuth(auth);
+      setApiKeyInput(auth.api_key ?? "");
+      setAdminPasswordInput(auth.admin_password ?? "");
+      setAdminAuthLocked(false);
+      setNotice("Web Console unlocked (sessionStorage only).");
+    } catch (e) {
+      clearSessionAdminPassword();
+      handleApiError(e, "Admin unlock failed");
+    }
+  }
+
+  function handleLockWebAdmin() {
+    clearSessionAdminPassword();
+    setAdminAuthLocked(true);
+    setNotice("Admin session cleared from sessionStorage.");
+  }
+
   async function switchMode(mode: "lock" | "stage_aware") {
-    if (!isTauri()) return;
-    await invoke("set_route_mode", { mode });
-    setRouteMode(mode);
-    setNotice(`Route mode hot-switched to ${mode}`);
+    try {
+      await gatewayClient.setRouteMode(mode);
+      setRouteMode(mode);
+      setNotice(`Route mode hot-switched to ${mode}`);
+    } catch (e) {
+      handleApiError(e, "Switch mode failed");
+    }
   }
 
   function openNewChannelForm() {
@@ -567,16 +461,13 @@ export default function App() {
   }
 
   async function handleScanLocalProviders() {
-    if (!isTauri()) return;
     setScanningLocal(true);
     try {
       const customPorts = localCustomPorts
         .split(",")
         .map((s) => Number(s.trim()))
         .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535);
-      const found = await invoke<DiscoveredLocalProvider[]>("scan_local_providers", {
-        customPorts,
-      });
+      const found = await gatewayClient.scanLocalProviders(customPorts);
       setDiscoveredLocals(found);
       setNotice(
         found.length > 0
@@ -584,20 +475,19 @@ export default function App() {
           : "No local Ollama (11434) / LM Studio (1234) / vLLM (8000) services responded within 350ms."
       );
     } catch (e) {
-      setNotice(`Local scan failed: ${String(e)}`);
+      handleApiError(e, "Local scan failed");
     } finally {
       setScanningLocal(false);
     }
   }
 
   async function handleImportLocalProvider(provider: DiscoveredLocalProvider) {
-    if (!isTauri()) return;
     try {
-      const ch = await invoke<ChannelSnapshot>("import_local_provider", {
+      const ch = await gatewayClient.importLocalProvider(
         provider,
-        channelId: null,
-        offlineFallback: importAsOfflineFallback,
-      });
+        null,
+        importAsOfflineFallback
+      );
       await refreshAll();
       setNotice(
         `Imported '${ch.id}' (${ch.models.length} model(s))${
@@ -605,81 +495,75 @@ export default function App() {
         } and persisted to config.local.toml.`
       );
     } catch (e) {
-      setNotice(`Import local provider failed: ${String(e)}`);
+      handleApiError(e, "Import local provider failed");
     }
   }
 
   async function handleSaveChannel() {
-    if (!isTauri()) return;
     try {
       const payload = buildChannelFromForm();
-      const saved = await invoke<ChannelSnapshot>("upsert_channel", { channel: payload });
+      const saved = await gatewayClient.upsertChannel(payload);
       setShowChannelForm(false);
       await refreshAll();
       setNotice(
         `Saved channel '${saved.id}' (${saved.base_url}) and persisted atomically to config.local.toml.`
       );
     } catch (e) {
-      setNotice(`Save channel failed: ${String(e)}`);
+      handleApiError(e, "Save channel failed");
     }
   }
 
   async function handleDeleteChannel(id: string) {
-    if (!isTauri()) return;
     try {
-      await invoke<boolean>("delete_channel", { id });
+      await gatewayClient.deleteChannel(id);
       await refreshAll();
       setNotice(`Removed channel '${id}' from live pool and config.local.toml.`);
     } catch (e) {
-      setNotice(`Delete channel failed: ${String(e)}`);
+      handleApiError(e, "Delete channel failed");
     }
   }
 
   async function handleToggleChannel(id: string, enabled: boolean) {
-    if (!isTauri()) return;
     try {
-      await invoke<ChannelSnapshot>("toggle_channel", { id, enabled });
+      await gatewayClient.toggleChannel(id, enabled);
       await refreshAll();
       setNotice(`Channel '${id}' ${enabled ? "enabled" : "disabled"}.`);
     } catch (e) {
-      setNotice(`Toggle channel failed: ${String(e)}`);
+      handleApiError(e, "Toggle channel failed");
     }
   }
 
   async function handleTestChannel(cfg: ChannelConfig) {
-    if (!isTauri()) return;
     setTestingId(cfg.id || "__draft__");
     try {
-      const res = await invoke<ChannelTestResult>("test_channel_connection", { channel: cfg });
+      const res = await gatewayClient.testChannelConnection(cfg);
       setTestResults((prev) => ({ ...prev, [cfg.id || "__draft__"]: res }));
       setNotice(
         `Probe '${cfg.id || "draft"}': ${res.ok ? "OK" : "FAIL"} (${res.latency_ms} ms) — ${res.message}`
       );
     } catch (e) {
-      setNotice(`Probe failed: ${String(e)}`);
+      handleApiError(e, "Probe failed");
     } finally {
       setTestingId(null);
     }
   }
 
   async function toggleAutostart() {
-    if (!isTauri()) return;
     try {
-      const next = await invoke<boolean>("set_autostart_enabled", { enabled: !autostart });
+      const next = await gatewayClient.setAutostartEnabled(!autostart);
       setAutostart(next);
       setNotice(next ? "Launch at login enabled (Windows Run key)." : "Launch at login disabled.");
     } catch (e) {
-      setNotice(`Autostart update failed: ${String(e)}`);
+      handleApiError(e, "Autostart update failed");
     }
   }
 
   async function saveAuthSettings() {
-    if (!isTauri()) return;
     try {
-      const saved = await invoke<AuthSettings>("set_auth_settings", {
-        apiKey: apiKeyInput.trim() || null,
-        adminPassword: adminPasswordInput.trim() || null,
-      });
+      const saved = await gatewayClient.setAuthSettings(
+        apiKeyInput.trim() || null,
+        adminPasswordInput.trim() || null
+      );
       setActiveAuth(saved);
       setApiKeyInput(saved.api_key ?? "");
       setAdminPasswordInput(saved.admin_password ?? "");
@@ -690,7 +574,7 @@ export default function App() {
         }, Admin Password: ${saved.admin_password ? "Protected" : "Open"}).`
       );
     } catch (e) {
-      setNotice(`Save auth settings failed: ${String(e)}`);
+      handleApiError(e, "Save auth settings failed");
     }
   }
 
@@ -703,61 +587,56 @@ export default function App() {
   }
 
   async function handleCloudLogin() {
-    if (!isTauri()) return;
     try {
-      const st = await invoke<CloudSessionStatus>("cloud_login", {
-        controlPlaneUrl: cloudUrl,
-        email: cloudEmail,
-        password: cloudPassword,
-      });
+      const st = await gatewayClient.cloudLogin(cloudUrl, cloudEmail, cloudPassword);
       setCloudStatus(st);
       await refreshAll();
       setNotice(
         `Connected to Cloud Control Plane (${st.tenant_id}, ${st.synced_channels} team channels synced).`
       );
     } catch (e) {
-      setNotice(`Cloud login failed: ${String(e)}`);
+      handleApiError(e, "Cloud login failed");
     }
   }
 
   async function handleCloudSync() {
-    if (!isTauri()) return;
     try {
-      const st = await invoke<CloudSessionStatus>("cloud_sync");
+      const st = await gatewayClient.cloudSync();
       setCloudStatus(st);
       await refreshAll();
       setNotice(`Synced ${st.synced_channels} team channels from Cloud Control Plane.`);
     } catch (e) {
-      setNotice(`Cloud sync failed: ${String(e)}`);
+      handleApiError(e, "Cloud sync failed");
     }
   }
 
   async function handleCloudLogout() {
-    if (!isTauri()) return;
-    const st = await invoke<CloudSessionStatus>("cloud_logout");
-    setCloudStatus(st);
-    setNotice("Disconnected from Cloud Control Plane (running in local-only privacy mode).");
+    try {
+      const st = await gatewayClient.cloudLogout();
+      setCloudStatus(st);
+      setNotice("Disconnected from Cloud Control Plane (running in local-only privacy mode).");
+    } catch (e) {
+      handleApiError(e, "Cloud logout failed");
+    }
   }
 
   async function handleTakeoverProfile(profileId: string) {
-    if (!isTauri()) return;
     try {
-      await invoke("takeover_client_profile", { profileId });
+      await gatewayClient.takeoverClientProfile(profileId);
       await refreshAll();
       setNotice(`Atomically took over '${profileId}' config (backup created).`);
     } catch (e) {
-      setNotice(`Takeover failed: ${String(e)}`);
+      handleApiError(e, "Takeover failed");
     }
   }
 
   async function handleRestoreProfile(profileId: string) {
-    if (!isTauri()) return;
     try {
-      await invoke("restore_client_profile", { profileId });
+      await gatewayClient.restoreClientProfile(profileId);
       await refreshAll();
       setNotice(`Restored original '${profileId}' config from backup.`);
     } catch (e) {
-      setNotice(`Restore failed: ${String(e)}`);
+      handleApiError(e, "Restore failed");
     }
   }
 
@@ -773,40 +652,37 @@ export default function App() {
   async function openSession(sessionId: string) {
     setSelectedSession(sessionId);
     setDiffResult(null);
-    if (!isTauri()) return;
-    const st = await invoke<TrajectoryStep[]>("get_session_steps", { sessionId });
-    setSteps(st);
+    try {
+      const st = await gatewayClient.getSessionSteps(sessionId);
+      setSteps(st);
+    } catch (e) {
+      handleApiError(e, "Load session failed");
+    }
   }
 
   async function handleFork(stepId: string) {
-    if (!isTauri()) return;
     setForkingStep(stepId);
     try {
-      const res = await invoke<ForkDiffResult>("fork_and_diff_step", {
-        stepId,
-        targetModel: forkModel,
-      });
+      const res = await gatewayClient.forkAndDiffStep(stepId, forkModel);
       setDiffResult(res);
       if (selectedSession) {
-        const st = await invoke<TrajectoryStep[]>("get_session_steps", {
-          sessionId: selectedSession,
-        });
+        const st = await gatewayClient.getSessionSteps(selectedSession);
         setSteps(st);
       }
     } catch (e) {
-      setNotice(`Fork failed: ${String(e)}`);
+      handleApiError(e, "Fork failed");
     } finally {
       setForkingStep(null);
     }
   }
 
   async function fetchExportData(): Promise<ForkDiffExport | null> {
-    if (!diffResult || !isTauri()) return null;
-    return await invoke<ForkDiffExport>("export_fork_diff_markdown", {
-      originalStepId: diffResult.original.step_id,
-      forkedStepId: diffResult.forked.step_id,
-      redactSecrets: redactOnExport,
-    });
+    if (!diffResult) return null;
+    return await gatewayClient.exportForkDiffMarkdown(
+      diffResult.original.step_id,
+      diffResult.forked.step_id,
+      redactOnExport
+    );
   }
 
   async function handleCopyMarkdownReport() {
@@ -886,6 +762,7 @@ export default function App() {
           <span>LoomGate</span>
           <span className="pill ok">{bindAddr}</span>
           <span className="pill">{routeMode === "lock" ? "Lock Mode" : "Stage-Aware"}</span>
+          <span className="pill">{isDesktop() ? "Desktop" : "Web Console"}</span>
         </div>
         <div className="tabs">
           <button
@@ -916,6 +793,43 @@ export default function App() {
       </header>
 
       <main className="main">
+        {!isDesktop() && adminAuthLocked && (
+          <div className="card row" style={{ borderColor: "var(--warn)", flexWrap: "wrap" }}>
+            <div>
+              <strong>Admin Authentication Required</strong>
+              <div style={{ color: "var(--muted)", fontSize: 12 }}>
+                Enter the gateway <code>admin_password</code> (stored in ephemeral browser{" "}
+                <code>sessionStorage</code> only, sent via <code>x-admin-password</code>).
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input
+                type="password"
+                value={webAdminPrompt}
+                onChange={(e) => setWebAdminPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleUnlockWebAdmin();
+                }}
+                placeholder="Admin password"
+              />
+              <button className="btn" onClick={handleUnlockWebAdmin}>
+                Unlock Console
+              </button>
+            </div>
+          </div>
+        )}
+
+        {!isDesktop() && !adminAuthLocked && getSessionAdminPassword() && (
+          <div className="card row" style={{ padding: "8px 14px" }}>
+            <span style={{ fontSize: 12, color: "var(--muted)" }}>
+              Authenticated via browser <code>sessionStorage</code> (<code>x-admin-password</code>).
+            </span>
+            <button className="btn secondary" onClick={handleLockWebAdmin}>
+              Lock Console
+            </button>
+          </div>
+        )}
+
         {notice && (
           <div className="card row">
             <span>{notice}</span>
@@ -1277,14 +1191,17 @@ export default function App() {
                 <div>
                   <strong>Launch LoomGate at Login</strong>
                   <div style={{ color: "var(--muted)", fontSize: 12 }}>
-                    Registers current executable under HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
+                    {isDesktop()
+                      ? "Registers current executable under HKCU\\Software\\Microsoft\\CurrentVersion\\Run."
+                      : "Available in LoomGate Desktop app (not applicable in Docker / Web Console mode)."}
                   </div>
                 </div>
                 <button
                   className={`btn ${autostart ? "" : "secondary"}`}
+                  disabled={!isDesktop()}
                   onClick={toggleAutostart}
                 >
-                  {autostart ? "Enabled" : "Disabled"}
+                  {!isDesktop() ? "Desktop Only" : autostart ? "Enabled" : "Disabled"}
                 </button>
               </div>
               <div
