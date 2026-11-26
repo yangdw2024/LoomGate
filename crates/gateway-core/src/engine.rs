@@ -13,8 +13,8 @@ use crate::router::{ChannelRuntime, ChannelSnapshot, StickyP2cRouter};
 use crate::signature_cache::SignatureCache;
 use crate::sse_fsm::{CancelPropagatingStream, SseFrameParser, StreamMetrics};
 use crate::trajectory::{
-    new_step_id, now_epoch_ms, ForkDiffResult, SavingsSummary, SessionSummary, TrajectoryError,
-    TrajectoryStep, TrajectoryStore,
+    new_step_id, now_epoch_ms, render_fork_diff_markdown, ForkDiffExport, ForkDiffResult,
+    SavingsSummary, SessionSummary, TrajectoryError, TrajectoryStep, TrajectoryStore,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -452,6 +452,17 @@ impl GatewayEngine {
     pub fn get_savings_summary(&self, days: u32) -> Result<SavingsSummary, TrajectoryError> {
         self.trajectory
             .get_savings_summary(days, &self.config.model_pricing)
+    }
+
+    pub fn export_fork_diff_markdown(
+        &self,
+        original_step_id: &str,
+        forked_step_id: &str,
+        redact_secrets: bool,
+    ) -> Result<ForkDiffExport, GatewayError> {
+        let original = self.trajectory.get_step(original_step_id)?;
+        let forked = self.trajectory.get_step(forked_step_id)?;
+        Ok(render_fork_diff_markdown(&original, &forked, redact_secrets))
     }
 
     fn http_client_for_channel(&self, cfg: &ChannelConfig) -> Result<Client, GatewayError> {

@@ -146,6 +146,18 @@ interface ForkDiffResult {
   cache_hit_ratio_delta: number;
 }
 
+interface ForkDiffExport {
+  original_step_id: string;
+  forked_step_id: string;
+  original_model: string;
+  forked_model: string;
+  redacted: boolean;
+  redactions_applied: number;
+  sanitized_original_text: string;
+  sanitized_forked_text: string;
+  markdown: string;
+}
+
 interface CloudSessionStatus {
   connected: boolean;
   control_plane_url: string | null;
@@ -202,6 +214,178 @@ function computeLineDiff(oldText: string, newText: string): DiffLine[] {
   return result;
 }
 
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildShareCardSvg(
+  diff: ForkDiffResult,
+  origText: string,
+  forkText: string,
+  redacted: boolean,
+  redactionsApplied: number
+): string {
+  const lines = computeLineDiff(origText, forkText).slice(0, 18);
+  const width = 960;
+  const headerH = 132;
+  const rowH = 22;
+  const height = headerH + Math.max(lines.length, 1) * rowH + 44;
+  const origTotalIn = diff.original.input_tokens + diff.original.cache_read_tokens;
+  const forkTotalIn = diff.forked.input_tokens + diff.forked.cache_read_tokens;
+  const origHit = origTotalIn > 0 ? Math.round((diff.original.cache_read_tokens / origTotalIn) * 100) : 0;
+  const forkHit = forkTotalIn > 0 ? Math.round((diff.forked.cache_read_tokens / forkTotalIn) * 100) : 0;
+  const ttftSign = diff.ttft_delta_ms >= 0 ? "+" : "";
+  const outSign = diff.output_tokens_delta >= 0 ? "+" : "";
+
+  const diffRows = lines
+    .map((dl, idx) => {
+      const y = headerH + idx * rowH;
+      const bg =
+        dl.kind === "add"
+          ? "rgba(63,185,80,0.18)"
+          : dl.kind === "del"
+          ? "rgba(248,81,73,0.18)"
+          : "transparent";
+      const fg = dl.kind === "add" ? "#aff5b4" : dl.kind === "del" ? "#ffdcd7" : "#8b949e";
+      const sigil = dl.kind === "add" ? "+" : dl.kind === "del" ? "-" : " ";
+      const text = (dl.text || " ").slice(0, 108);
+      return `<rect x="24" y="${y}" width="${width - 48}" height="${rowH}" fill="${bg}"/>
+        <text x="36" y="${y + 15}" fill="${fg}" font-family="ui-monospace,Consolas,monospace" font-size="12">${escapeXml(
+        `${sigil} ${text}`
+      )}</text>`;
+    })
+    .join("\n");
+
+  const badge = redacted
+    ? `Guardrail Redacted (${redactionsApplied})`
+    : "Raw Local Export";
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <rect width="${width}" height="${height}" rx="14" fill="#0d1117"/>
+  <rect x="12" y="12" width="${width - 24}" height="${height - 24}" rx="10" fill="#161b22" stroke="#30363d"/>
+  <text x="28" y="42" fill="#e6edf3" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="700">LoomGate Trajectory Fork &amp; Diff</text>
+  <text x="${width - 28}" y="40" text-anchor="end" fill="#3fb950" font-family="Segoe UI,Arial,sans-serif" font-size="12">${escapeXml(badge)}</text>
+  <text x="28" y="68" fill="#58a6ff" font-family="ui-monospace,Consolas,monospace" font-size="13">${escapeXml(
+    `${diff.original.actual_model}  →  ${diff.forked.actual_model}`
+  )}</text>
+  <text x="28" y="92" fill="#8b949e" font-family="Segoe UI,Arial,sans-serif" font-size="12">${escapeXml(
+    `TTFT: ${diff.original.ttft_ms}ms vs ${diff.forked.ttft_ms}ms (${ttftSign}${diff.ttft_delta_ms}ms)  |  Output: ${diff.original.output_tokens} vs ${diff.forked.output_tokens} tok (${outSign}${diff.output_tokens_delta})  |  KV Cache: ${origHit}% vs ${forkHit}%`
+  )}</text>
+  <rect x="24" y="${headerH - 14}" width="${width - 48}" height="${Math.max(lines.length, 1) * rowH + 20}" rx="6" fill="#090c10" stroke="#30363d"/>
+  ${diffRows}
+  <text x="28" y="${height - 18}" fill="#6e7681" font-family="Segoe UI,Arial,sans-serif" font-size="11">Generated locally by LoomGate Studio (zero raw prompts uploaded)</text>
+</svg>`;
+}
+
+/** Pure Canvas 2D share card renderer (NO SVG foreignObject -> never taints Windows WebView2 canvas). */
+function renderShareCardPngDataUrl(
+  diff: ForkDiffResult,
+  origText: string,
+  forkText: string,
+  redacted: boolean,
+  redactionsApplied: number
+): string {
+  const lines = computeLineDiff(origText, forkText).slice(0, 18);
+  const width = 960;
+  const headerH = 132;
+  const rowH = 22;
+  const height = headerH + Math.max(lines.length, 1) * rowH + 44;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width * 2;
+  canvas.height = height * 2;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+  ctx.scale(2, 2);
+
+  // Outer background + card border
+  ctx.fillStyle = "#0d1117";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#161b22";
+  ctx.fillRect(12, 12, width - 24, height - 24);
+  ctx.strokeStyle = "#30363d";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(12.5, 12.5, width - 25, height - 25);
+
+  // Header
+  ctx.fillStyle = "#e6edf3";
+  ctx.font = "700 18px 'Segoe UI', Arial, sans-serif";
+  ctx.fillText("LoomGate Trajectory Fork & Diff", 28, 42);
+
+  const badge = redacted
+    ? `Guardrail Redacted (${redactionsApplied})`
+    : "Raw Local Export";
+  ctx.fillStyle = redacted ? "#3fb950" : "#d29922";
+  ctx.font = "600 12px 'Segoe UI', Arial, sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillText(badge, width - 28, 40);
+  ctx.textAlign = "left";
+
+  ctx.fillStyle = "#58a6ff";
+  ctx.font = "600 13px Consolas, monospace";
+  ctx.fillText(`${diff.original.actual_model}  ->  ${diff.forked.actual_model}`, 28, 68);
+
+  const origTotalIn = diff.original.input_tokens + diff.original.cache_read_tokens;
+  const forkTotalIn = diff.forked.input_tokens + diff.forked.cache_read_tokens;
+  const origHit = origTotalIn > 0 ? Math.round((diff.original.cache_read_tokens / origTotalIn) * 100) : 0;
+  const forkHit = forkTotalIn > 0 ? Math.round((diff.forked.cache_read_tokens / forkTotalIn) * 100) : 0;
+  const ttftSign = diff.ttft_delta_ms >= 0 ? "+" : "";
+  const outSign = diff.output_tokens_delta >= 0 ? "+" : "";
+
+  ctx.fillStyle = "#8b949e";
+  ctx.font = "12px 'Segoe UI', Arial, sans-serif";
+  ctx.fillText(
+    `TTFT: ${diff.original.ttft_ms}ms vs ${diff.forked.ttft_ms}ms (${ttftSign}${diff.ttft_delta_ms}ms)  |  Output: ${diff.original.output_tokens} vs ${diff.forked.output_tokens} tok (${outSign}${diff.output_tokens_delta})  |  KV Cache: ${origHit}% vs ${forkHit}%`,
+    28,
+    92
+  );
+
+  // Diff box
+  const boxH = Math.max(lines.length, 1) * rowH + 20;
+  ctx.fillStyle = "#090c10";
+  ctx.fillRect(24, headerH - 14, width - 48, boxH);
+  ctx.strokeStyle = "#30363d";
+  ctx.strokeRect(24.5, headerH - 13.5, width - 49, boxH - 1);
+
+  ctx.font = "12px Consolas, monospace";
+  lines.forEach((dl, idx) => {
+    const y = headerH + idx * rowH;
+    if (dl.kind === "add") {
+      ctx.fillStyle = "rgba(63,185,80,0.18)";
+      ctx.fillRect(25, y, width - 50, rowH);
+      ctx.fillStyle = "#aff5b4";
+    } else if (dl.kind === "del") {
+      ctx.fillStyle = "rgba(248,81,73,0.18)";
+      ctx.fillRect(25, y, width - 50, rowH);
+      ctx.fillStyle = "#ffdcd7";
+    } else {
+      ctx.fillStyle = "#8b949e";
+    }
+    const sigil = dl.kind === "add" ? "+" : dl.kind === "del" ? "-" : " ";
+    ctx.fillText(`${sigil} ${(dl.text || " ").slice(0, 108)}`, 36, y + 15);
+  });
+
+  ctx.fillStyle = "#6e7681";
+  ctx.font = "11px 'Segoe UI', Arial, sans-serif";
+  ctx.fillText("Generated locally by LoomGate Studio (zero raw prompts uploaded)", 28, height - 18);
+
+  return canvas.toDataURL("image/png");
+}
+
+function triggerDownload(filename: string, href: string) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const emptyChannelForm = () => ({
@@ -247,6 +431,7 @@ export default function App() {
   const [forkingStep, setForkingStep] = useState<string | null>(null);
   const [diffResult, setDiffResult] = useState<ForkDiffResult | null>(null);
   const [diffViewMode, setDiffViewMode] = useState<"unified" | "split">("unified");
+  const [redactOnExport, setRedactOnExport] = useState<boolean>(true);
 
   const [autostart, setAutostart] = useState<boolean>(false);
   const [apiKeyInput, setApiKeyInput] = useState<string>("");
@@ -612,6 +797,79 @@ export default function App() {
       setNotice(`Fork failed: ${String(e)}`);
     } finally {
       setForkingStep(null);
+    }
+  }
+
+  async function fetchExportData(): Promise<ForkDiffExport | null> {
+    if (!diffResult || !isTauri()) return null;
+    return await invoke<ForkDiffExport>("export_fork_diff_markdown", {
+      originalStepId: diffResult.original.step_id,
+      forkedStepId: diffResult.forked.step_id,
+      redactSecrets: redactOnExport,
+    });
+  }
+
+  async function handleCopyMarkdownReport() {
+    try {
+      const exp = await fetchExportData();
+      if (!exp) return;
+      await copyText("Markdown Fork & Diff Report", exp.markdown);
+      setNotice(
+        `Copied Markdown report (${exp.redacted ? `Guardrail redacted ${exp.redactions_applied} secret/PII item(s)` : "raw unredacted"}).`
+      );
+    } catch (e) {
+      setNotice(`Export Markdown failed: ${String(e)}`);
+    }
+  }
+
+  async function handleExportSvgCard() {
+    if (!diffResult) return;
+    try {
+      const exp = await fetchExportData();
+      if (!exp) return;
+      const svg = buildShareCardSvg(
+        diffResult,
+        exp.sanitized_original_text,
+        exp.sanitized_forked_text,
+        exp.redacted,
+        exp.redactions_applied
+      );
+      const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      triggerDownload(
+        `loomgate-diff-${diffResult.original.actual_model}-vs-${diffResult.forked.actual_model}.svg`,
+        url
+      );
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setNotice(
+        `Exported SVG share card (${exp.redacted ? `${exp.redactions_applied} redaction(s) applied` : "raw"}).`
+      );
+    } catch (e) {
+      setNotice(`Export SVG failed: ${String(e)}`);
+    }
+  }
+
+  async function handleExportPngCard() {
+    if (!diffResult) return;
+    try {
+      const exp = await fetchExportData();
+      if (!exp) return;
+      const dataUrl = renderShareCardPngDataUrl(
+        diffResult,
+        exp.sanitized_original_text,
+        exp.sanitized_forked_text,
+        exp.redacted,
+        exp.redactions_applied
+      );
+      triggerDownload(
+        `loomgate-diff-${diffResult.original.actual_model}-vs-${diffResult.forked.actual_model}.png`,
+        dataUrl
+      );
+      setNotice(
+        `Exported PNG share card via pure Canvas 2D (${exp.redacted ? `${exp.redactions_applied} redaction(s) applied` : "raw"}).`
+      );
+    } catch (e) {
+      setNotice(`Export PNG failed: ${String(e)}`);
     }
   }
 
@@ -1382,6 +1640,27 @@ export default function App() {
                         onClick={() => setDiffViewMode("split")}
                       >
                         Side-by-Side
+                      </button>
+                    </div>
+                  </div>
+                  <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                      <input
+                        type="checkbox"
+                        checked={redactOnExport}
+                        onChange={(e) => setRedactOnExport(e.target.checked)}
+                      />
+                      Redact Secrets &amp; PII before export (Guardrail)
+                    </label>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <button className="btn secondary" onClick={handleCopyMarkdownReport}>
+                        Copy Markdown Report
+                      </button>
+                      <button className="btn secondary" onClick={handleExportSvgCard}>
+                        Export SVG Card
+                      </button>
+                      <button className="btn" onClick={handleExportPngCard}>
+                        Export PNG Card
                       </button>
                     </div>
                   </div>

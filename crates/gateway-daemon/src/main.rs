@@ -30,6 +30,18 @@ struct ForkRequest {
 }
 
 #[derive(Deserialize)]
+struct ExportDiffRequest {
+    original_step_id: String,
+    forked_step_id: String,
+    #[serde(default = "default_true")]
+    redact_secrets: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
 struct McpCallRequest {
     tool: String,
     #[serde(default)]
@@ -153,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:session_id/steps", get(get_session_steps))
         .route("/api/steps/:step_id/fork", post(fork_step))
+        .route("/api/steps/export-diff", post(export_diff))
         .route("/api/middleware", get(list_middleware))
         .route("/api/mcp/call", post(call_mcp_tool))
         .route("/api/cloud/status", get(cloud_status))
@@ -184,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!(bind_addr = %bind_addr, db = %db_path, "LoomGate local daemon listening (v0.4.0)");
+    info!(bind_addr = %bind_addr, db = %db_path, "LoomGate local daemon listening (v0.5.0)");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -194,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "kernel": "gateway-core",
         "route_mode": format!("{:?}", state.engine.active_route_mode()).to_lowercase()
     }))
@@ -373,6 +386,24 @@ async fn fork_step(
         .await
     {
         Ok(diff) => Json(diff).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn export_diff(
+    State(state): State<AppState>,
+    Json(req): Json<ExportDiffRequest>,
+) -> impl IntoResponse {
+    match state.engine.export_fork_diff_markdown(
+        &req.original_step_id,
+        &req.forked_step_id,
+        req.redact_secrets,
+    ) {
+        Ok(exported) => Json(exported).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),

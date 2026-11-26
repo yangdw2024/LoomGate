@@ -126,6 +126,18 @@ export interface SavingsSummary {
   by_model: ModelSavingsRow[];
 }
 
+export interface ForkDiffExport {
+  original_step_id: string;
+  forked_step_id: string;
+  original_model: string;
+  forked_model: string;
+  redacted: boolean;
+  redactions_applied: number;
+  sanitized_original_text: string;
+  sanitized_forked_text: string;
+  markdown: string;
+}
+
 export interface GatewayCallResult<T = unknown> {
   status: number;
   headers: Record<string, string>;
@@ -145,6 +157,11 @@ export class LoomGateClient {
   sessions(): Promise<SessionSummary[]>;
   sessionSteps(sessionId: string): Promise<TrajectoryStep[]>;
   forkStep(stepId: string, targetModel: string): Promise<ForkDiffResult>;
+  exportForkDiff(
+    originalStepId: string,
+    forkedStepId: string,
+    redactSecrets?: boolean
+  ): Promise<ForkDiffExport>;
   callMcpTool(tool: string, args?: Record<string, unknown>): Promise<{ ok: boolean; result?: unknown; error?: string }>;
 
   cloudStatus(): Promise<CloudSessionStatus>;

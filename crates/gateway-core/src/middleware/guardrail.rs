@@ -99,27 +99,69 @@ fn redact_emails_and_phones(input: &str) -> (String, usize) {
     (out, count)
 }
 
+fn redact_bearer_tokens(input: &str, placeholder: &str) -> (String, usize) {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut count = 0;
+
+    while i < bytes.len() {
+        let boundary_ok = i == 0 || !is_token_char(bytes[i - 1]);
+        if boundary_ok && bytes.len().saturating_sub(i) >= 7 {
+            let prefix = &input[i..i + 7];
+            if prefix.eq_ignore_ascii_case("Bearer ") {
+                let mut tok_start = i + 7;
+                while tok_start < bytes.len() && bytes[tok_start] == b' ' {
+                    tok_start += 1;
+                }
+                let mut end = tok_start;
+                while end < bytes.len() && is_token_char(bytes[end]) {
+                    end += 1;
+                }
+                if end.saturating_sub(tok_start) >= 8 {
+                    out.push_str(&input[i..tok_start]);
+                    out.push_str(placeholder);
+                    i = end;
+                    count += 1;
+                    continue;
+                }
+            }
+        }
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, count)
+}
+
+/// Shared Guardrail redaction routine reused by both the live Onion Middleware and
+/// Trajectory Studio 2.0 Markdown/Share-Card exporters.
+pub fn redact_sensitive_text(text: &str, redact_secrets: bool, redact_pii: bool) -> (String, usize) {
+    let mut current = text.to_string();
+    let mut total = 0;
+
+    if redact_secrets {
+        let (next, c1) = redact_prefixed_tokens(
+            &current,
+            &["sk-ant-", "sk-", "AIza", "ghp_", "gho_", "AKIA"],
+            "[REDACTED_SECRET]",
+        );
+        let (next2, c2) = redact_bearer_tokens(&next, "[REDACTED_SECRET]");
+        current = next2;
+        total += c1 + c2;
+    }
+    if redact_pii {
+        let (next, c) = redact_emails_and_phones(&current);
+        current = next;
+        total += c;
+    }
+
+    (current, total)
+}
+
 impl GuardrailMiddleware {
     fn redact_text(&self, text: &str) -> (String, usize) {
-        let mut current = text.to_string();
-        let mut total = 0;
-
-        if self.redact_secrets {
-            let (next, c) = redact_prefixed_tokens(
-                &current,
-                &["sk-ant-", "sk-", "AIza", "ghp_", "gho_", "AKIA"],
-                "[REDACTED_SECRET]",
-            );
-            current = next;
-            total += c;
-        }
-        if self.redact_pii {
-            let (next, c) = redact_emails_and_phones(&current);
-            current = next;
-            total += c;
-        }
-
-        (current, total)
+        redact_sensitive_text(text, self.redact_secrets, self.redact_pii)
     }
 
     fn check_tool_call(&self, name: &str, args_json: &str) -> Result<(), String> {

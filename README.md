@@ -6,23 +6,26 @@ Built for zero-friction AI coding agents (**Claude Code, Codex CLI, Gemini CLI, 
 
 ---
 
-## Download & Install (v0.4.0 Zero-Config Out-of-the-Box)
+## Download & Install (v0.5.0 Trajectory Studio 2.0 + Local Discovery + Savings Dashboard)
 
 ### Desktop App (Recommended)
 Download the pre-built native installer from **[GitHub Releases](https://github.com/yangdw2024/LoomGate/releases)**:
-- **Windows**: `LoomGate_0.4.0_x64-setup.exe` (NSIS) or `.msi`
-- **macOS**: `LoomGate_0.4.0_aarch64.dmg`
-- **Linux**: `LoomGate_0.4.0_amd64.AppImage` or `.deb`
+- **Windows**: `LoomGate_0.5.0_x64-setup.exe` (NSIS) or `.msi`
+- **macOS**: `LoomGate_0.5.0_aarch64.dmg`
+- **Linux**: `LoomGate_0.5.0_amd64.AppImage` or `.deb`
 
-Launch **LoomGate Studio**, click **+ Add Channel** in the **Channels & Routing** tab (trailing `/v1` or `/v1beta` is auto-stripped; optionally configure per-channel HTTP/SOCKS5 proxy, Stage-Aware fallback models, and quota probe URL), click **Test** to verify latency, then head to **Client Integrations** to connect your favorite coding agent in one click.
+Launch **LoomGate Studio**, click **Scan Local Models (Ollama / LM Studio / vLLM)** to import local runtimes as an automatic **Offline Fallback**, or click **+ Add Channel** to add cloud providers (trailing `/v1` or `/v1beta` is auto-stripped; per-channel HTTP/SOCKS5 proxy, Stage-Aware fallback models, and quota probe URL supported). Inspect real-time Prompt Caching savings & Ctrl+C stop-loss stats in **Savings & Telemetry**, and share Guardrail-redacted Fork & Diff reports as Markdown, SVG, or PNG directly from **Trajectory Fork & Diff**.
 
 ### Official npm SDK & CLI
 ```bash
 npm install loomgate
 # or invoke CLI directly
 npx loomgate status
+npx loomgate local scan
+npx loomgate savings 30
 npx loomgate sessions
 npx loomgate fork <step_id> gpt-4o
+npx loomgate diff-export <orig_step_id> <fork_step_id>
 npx loomgate cloud login http://127.0.0.1:8790 dev@loomgate.dev loomgate-dev-password
 ```
 
@@ -113,7 +116,7 @@ format = "json"
 ## Building from Source & Verification
 
 ```bash
-# 1. Lint & Unit Tests (22 tests across workspace)
+# 1. Lint & Unit Tests (25 tests across workspace)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
@@ -121,7 +124,7 @@ cargo test --workspace
 cd apps/desktop && npm ci && npm run build && cd ../..
 cd packages/loomgate && npm test && cd ../..
 
-# 3. Run Full 14/14 End-to-End Conformance Suite
+# 3. Run Full 17/17 End-to-End Conformance Suite
 python tests/mock_upstream.py &
 cargo run -p cloud-control-plane &
 GATEWAY_CONFIG=config.example.toml cargo run -p gateway-daemon &

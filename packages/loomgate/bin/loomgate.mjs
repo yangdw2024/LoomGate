@@ -2,13 +2,14 @@
 import { LoomGateClient } from "../dist/index.js";
 
 function usage() {
-  console.log(`LoomGate CLI v0.4.0 — Edge-Cloud Hybrid Microkernel AI Gateway
+  console.log(`LoomGate CLI v0.5.0 — Edge-Cloud Hybrid Microkernel AI Gateway
 
 Usage:
   loomgate status                                Show health, channels, middleware & cloud status
   loomgate sessions                              List local SQLite trajectory sessions
   loomgate steps <session_id>                    List turns/steps in a session
   loomgate fork <step_id> <target_model>         Fork & diff a historical step on another model
+  loomgate diff-export <orig_id> <fork_id>       Export Guardrail-redacted Markdown Fork & Diff report
   loomgate savings [days]                        Show Prompt Caching & Ctrl+C stop-loss savings (default: 30d)
   loomgate local scan [ports_csv]                Scan localhost for Ollama / LM Studio / vLLM runtimes
   loomgate mcp list                              List aggregated MCP tools & middleware layers
@@ -49,6 +50,10 @@ async function main() {
       console.log(JSON.stringify(await client.sessionSteps(sub), null, 2));
     } else if (cmd === "fork" && sub && a1) {
       console.log(JSON.stringify(await client.forkStep(sub, a1), null, 2));
+    } else if (cmd === "diff-export" && sub && a1) {
+      const noRedact = args.includes("--no-redact");
+      const res = await client.exportForkDiff(sub, a1, !noRedact);
+      console.log(res.markdown);
     } else if (cmd === "savings") {
       const days = sub !== undefined ? Number(sub) : 30;
       console.log(JSON.stringify(await client.savings(Number.isFinite(days) ? days : 30), null, 2));

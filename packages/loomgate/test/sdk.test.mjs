@@ -21,6 +21,8 @@ test("LoomGateClient interacts with health, channels, 3 protocols, fork & cloud 
         res.end(JSON.stringify({ window_days: 30, total_requests: 12, aborted_by_client_count: 2, total_cache_read_tokens: 450000, avg_cache_hit_ratio: 0.82, estimated_cache_savings_usd: 1.215, estimated_stop_loss_savings_usd: 0.024, by_model: [] }));
       } else if (req.url.startsWith("/api/local/discover")) {
         res.end(JSON.stringify({ providers: [{ kind: "ollama", display_name: "Ollama", suggested_channel_id: "local-ollama", base_url: "http://127.0.0.1:11434", port: 11434, models: ["qwen2.5-coder:7b"], latency_ms: 4 }] }));
+      } else if (req.url === "/api/steps/export-diff") {
+        res.end(JSON.stringify({ original_step_id: "s1", forked_step_id: "s2", original_model: "claude-sonnet-4-20250514", forked_model: "gpt-4o", redacted: true, redactions_applied: 2, sanitized_original_text: "[REDACTED_SECRET]", sanitized_forked_text: "ok", markdown: "# LoomGate Fork & Diff Report\n[REDACTED_SECRET]" }));
       } else if (req.url === "/v1beta/models/gemini-2.5-pro:generateContent") {
         res.setHeader("X-Gateway-Actual-Model", "gemini-2.5-pro");
         res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }));
@@ -53,6 +55,10 @@ test("LoomGateClient interacts with health, channels, 3 protocols, fork & cloud 
     const locals = await client.discoverLocal([11434]);
     assert.equal(locals.length, 1);
     assert.equal(locals[0].kind, "ollama");
+
+    const exp = await client.exportForkDiff("s1", "s2", true);
+    assert.equal(exp.redacted, true);
+    assert.equal(exp.redactions_applied, 2);
 
     const gem = await client.generateContent("gemini-2.5-pro", {
       contents: [{ role: "user", parts: [{ text: "hi" }] }],

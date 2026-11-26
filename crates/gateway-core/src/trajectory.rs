@@ -1,4 +1,5 @@
 use crate::config::ModelPricing;
+use crate::middleware::guardrail::redact_sensitive_text;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -74,6 +75,166 @@ pub struct ForkDiffResult {
     pub ttft_delta_ms: i64,
     pub output_tokens_delta: i64,
     pub cache_hit_ratio_delta: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkDiffExport {
+    pub original_step_id: String,
+    pub forked_step_id: String,
+    pub original_model: String,
+    pub forked_model: String,
+    pub redacted: bool,
+    pub redactions_applied: usize,
+    pub sanitized_original_text: String,
+    pub sanitized_forked_text: String,
+    pub markdown: String,
+}
+
+fn build_unified_line_diff(old_text: &str, new_text: &str, max_lines: usize) -> String {
+    let a: Vec<&str> = old_text.lines().collect();
+    let b: Vec<&str> = new_text.lines().collect();
+    let m = a.len();
+    let n = b.len();
+
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    let mut lines = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < m && j < n {
+        if a[i] == b[j] {
+            lines.push(format!("  {}", a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            lines.push(format!("- {}", a[i]));
+            i += 1;
+        } else {
+            lines.push(format!("+ {}", b[j]));
+            j += 1;
+        }
+    }
+    while i < m {
+        lines.push(format!("- {}", a[i]));
+        i += 1;
+    }
+    while j < n {
+        lines.push(format!("+ {}", b[j]));
+        j += 1;
+    }
+
+    if lines.len() > max_lines {
+        let omitted = lines.len() - max_lines;
+        lines.truncate(max_lines);
+        lines.push(format!("... ({} more diff lines omitted)", omitted));
+    }
+    lines.join("\n")
+}
+
+/// Generates a shareable Fork & Diff Markdown report comparing two trajectory steps,
+/// optionally applying `GuardrailMiddleware` secret & PII redaction (recommended ON by default).
+pub fn render_fork_diff_markdown(
+    original: &TrajectoryStep,
+    forked: &TrajectoryStep,
+    redact_secrets: bool,
+) -> ForkDiffExport {
+    let (orig_text, c1) = if redact_secrets {
+        redact_sensitive_text(&original.response_text, true, true)
+    } else {
+        (original.response_text.clone(), 0)
+    };
+    let (fork_text, c2) = if redact_secrets {
+        redact_sensitive_text(&forked.response_text, true, true)
+    } else {
+        (forked.response_text.clone(), 0)
+    };
+    let total_redactions = c1 + c2;
+
+    let ttft_delta = forked.ttft_ms as i64 - original.ttft_ms as i64;
+    let out_delta = forked.output_tokens as i64 - original.output_tokens as i64;
+    let orig_hit_pct = original.cache_hit_ratio() * 100.0;
+    let fork_hit_pct = forked.cache_hit_ratio() * 100.0;
+    let hit_delta_pp = fork_hit_pct - orig_hit_pct;
+    let diff_block = build_unified_line_diff(&orig_text, &fork_text, 120);
+
+    let privacy_banner = if redact_secrets {
+        format!(
+            "> Guardrail Redaction: **Enabled** ({} sensitive token(s)/PII scrubbed before export)\n",
+            total_redactions
+        )
+    } else {
+        "> Guardrail Redaction: **Disabled** (raw local output exported)\n".to_string()
+    };
+
+    let markdown = format!(
+        "# LoomGate Fork & Diff Report\n\n\
+         {privacy_banner}\n\
+         - **Session**: `{session}` (Turn {turn})\n\
+         - **Original Step**: `{orig_id}` → `{orig_model}` (`{orig_ch}`)\n\
+         - **Forked Step**: `{fork_id}` → `{fork_model}` (`{fork_ch}`)\n\n\
+         ## Performance & Token Comparison\n\n\
+         | Metric | Original (`{orig_model}`) | Forked (`{fork_model}`) | Delta |\n\
+         |---|---:|---:|---:|\n\
+         | TTFT | {orig_ttft} ms | {fork_ttft} ms | {ttft_sign}{ttft_delta} ms |\n\
+         | Input Tokens | {orig_in} | {fork_in} | {in_delta:+} |\n\
+         | Cache Read Tokens | {orig_cache} | {fork_cache} | {cache_delta:+} |\n\
+         | KV Cache Hit Rate | {orig_hit_pct:.1}% | {fork_hit_pct:.1}% | {hit_delta_pp:+.1} pp |\n\
+         | Output Tokens | {orig_out} | {fork_out} | {out_sign}{out_delta} |\n\
+         | Status | `{orig_status}` | `{fork_status}` | — |\n\n\
+         ## Response Diff\n\n\
+         ```diff\n\
+         {diff_block}\n\
+         ```\n",
+        privacy_banner = privacy_banner,
+        session = original.session_id,
+        turn = original.turn_index,
+        orig_id = original.step_id,
+        orig_model = original.actual_model,
+        orig_ch = original.channel_id,
+        fork_id = forked.step_id,
+        fork_model = forked.actual_model,
+        fork_ch = forked.channel_id,
+        orig_ttft = original.ttft_ms,
+        fork_ttft = forked.ttft_ms,
+        ttft_sign = if ttft_delta >= 0 { "+" } else { "" },
+        ttft_delta = ttft_delta,
+        orig_in = original.input_tokens,
+        fork_in = forked.input_tokens,
+        in_delta = forked.input_tokens as i64 - original.input_tokens as i64,
+        orig_cache = original.cache_read_tokens,
+        fork_cache = forked.cache_read_tokens,
+        cache_delta = forked.cache_read_tokens as i64 - original.cache_read_tokens as i64,
+        orig_hit_pct = orig_hit_pct,
+        fork_hit_pct = fork_hit_pct,
+        hit_delta_pp = hit_delta_pp,
+        orig_out = original.output_tokens,
+        fork_out = forked.output_tokens,
+        out_sign = if out_delta >= 0 { "+" } else { "" },
+        out_delta = out_delta,
+        orig_status = original.status,
+        fork_status = forked.status,
+        diff_block = diff_block,
+    );
+
+    ForkDiffExport {
+        original_step_id: original.step_id.clone(),
+        forked_step_id: forked.step_id.clone(),
+        original_model: original.actual_model.clone(),
+        forked_model: forked.actual_model.clone(),
+        redacted: redact_secrets,
+        redactions_applied: total_redactions,
+        sanitized_original_text: orig_text,
+        sanitized_forked_text: fork_text,
+        markdown,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,5 +806,52 @@ mod tests {
         assert!((summary.estimated_cache_savings_usd - 2.43).abs() < 1e-4);
         assert!(summary.estimated_stop_loss_savings_usd > 0.0);
         assert_eq!(summary.by_model.len(), 1);
+    }
+
+    #[test]
+    fn export_fork_diff_markdown_redacts_sk_and_bearer_tokens_by_default() {
+        let orig = TrajectoryStep {
+            step_id: "step_orig".into(),
+            workspace: "loomgate".into(),
+            session_id: "sess_export".into(),
+            parent_step_id: None,
+            turn_index: 2,
+            protocol: "anthropic".into(),
+            channel_id: "anthropic-primary".into(),
+            requested_model: "claude-sonnet-4-20250514".into(),
+            actual_model: "claude-sonnet-4-20250514".into(),
+            route_mode: "lock".into(),
+            sticky_hit: true,
+            ttft_ms: 320,
+            input_tokens: 200,
+            cache_read_tokens: 1800,
+            output_tokens: 45,
+            status: "completed".into(),
+            request_json: "{}".into(),
+            response_text: "Export token sk-ant-supersecret12345678\nAuthorization: Bearer tok_live_abc123456789".into(),
+            tool_calls_json: "[]".into(),
+            created_at_ms: 1000,
+        };
+        let forked = TrajectoryStep {
+            step_id: "step_fork".into(),
+            parent_step_id: Some("step_orig".into()),
+            actual_model: "gpt-4o".into(),
+            channel_id: "openai-primary".into(),
+            ttft_ms: 190,
+            output_tokens: 38,
+            response_text: "Safe reply without key\nContact ops@loomgate.dev".into(),
+            ..orig.clone()
+        };
+
+        let exported = render_fork_diff_markdown(&orig, &forked, true);
+        assert!(exported.redacted);
+        assert!(exported.redactions_applied >= 3);
+        assert!(!exported.markdown.contains("sk-ant-supersecret12345678"));
+        assert!(!exported.markdown.contains("tok_live_abc123456789"));
+        assert!(!exported.markdown.contains("ops@loomgate.dev"));
+        assert!(exported.markdown.contains("[REDACTED_SECRET]"));
+        assert!(exported.markdown.contains("[REDACTED_EMAIL]"));
+        assert!(exported.markdown.contains("## Performance & Token Comparison"));
+        assert!(exported.markdown.contains("```diff"));
     }
 }

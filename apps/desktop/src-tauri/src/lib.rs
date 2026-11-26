@@ -9,8 +9,9 @@ use axum::{
 use gateway_core::{
     discover_local_providers, AuthSettings, ChannelConfig, ChannelSnapshot, ChannelTestResult,
     CliIntegrationStatus, CliTakeoverManager, CliTool, ClientProfileStatus, CloudSessionStatus,
-    DiscoveredLocalProvider, ForkDiffResult, GatewayConfig, GatewayEngine, GatewayError,
-    GatewayResponse, RouteMode, SavingsSummary, SessionSummary, TrajectoryStep, UpstreamProtocol,
+    DiscoveredLocalProvider, ForkDiffExport, ForkDiffResult, GatewayConfig, GatewayEngine,
+    GatewayError, GatewayResponse, RouteMode, SavingsSummary, SessionSummary, TrajectoryStep,
+    UpstreamProtocol,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -403,6 +404,19 @@ async fn fork_and_diff_step(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn export_fork_diff_markdown(
+    state: TauriState<'_, DesktopState>,
+    original_step_id: String,
+    forked_step_id: String,
+    redact_secrets: bool,
+) -> Result<ForkDiffExport, String> {
+    state
+        .engine
+        .export_fork_diff_markdown(&original_step_id, &forked_step_id, redact_secrets)
+        .map_err(|e| e.to_string())
+}
+
 /// Starts the embedded local HTTP proxy (127.0.0.1:8787) sharing the exact `Arc<GatewayEngine>`
 /// managed by Tauri, so CLI tools and the Tray UI share zero-latency in-process state.
 async fn run_embedded_proxy(
@@ -792,6 +806,7 @@ pub fn run() {
             list_sessions,
             get_session_steps,
             fork_and_diff_step,
+            export_fork_diff_markdown,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Edge Gateway Tauri application");

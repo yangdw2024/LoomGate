@@ -89,6 +89,14 @@ export class LoomGateClient {
     });
   }
 
+  exportForkDiff(originalStepId, forkedStepId, redactSecrets = true) {
+    return this._mustOk("POST", "/api/steps/export-diff", {
+      original_step_id: originalStepId,
+      forked_step_id: forkedStepId,
+      redact_secrets: redactSecrets,
+    });
+  }
+
   callMcpTool(tool, args = {}) {
     return this._mustOk("POST", "/api/mcp/call", { tool, arguments: args });
   }

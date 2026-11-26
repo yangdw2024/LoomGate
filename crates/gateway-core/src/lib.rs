@@ -36,6 +36,6 @@ pub use middleware::{
 };
 pub use router::{ChannelHealth, ChannelSnapshot};
 pub use trajectory::{
-    ForkDiffResult, ModelSavingsRow, SavingsSummary, SessionSummary, TrajectoryError,
-    TrajectoryStep, TrajectoryStore,
+    render_fork_diff_markdown, ForkDiffExport, ForkDiffResult, ModelSavingsRow, SavingsSummary,
+    SessionSummary, TrajectoryError, TrajectoryStep, TrajectoryStore,
 };

@@ -2,6 +2,20 @@
 
 All notable changes to **LoomGate** are documented in this file.
 
+## [0.5.0] - 2026-11-25
+
+### Added
+- **Local Model Auto-Discovery & Offline Fallback (`crates/gateway-core/src/local_discovery.rs`)**:
+  - Parallel non-blocking scanner (`<= 350ms` per-probe timeout) detecting Ollama (`127.0.0.1:11434/api/tags`), LM Studio (`127.0.0.1:1234/v1/models`), vLLM (`127.0.0.1:8000/v1/models`), and user-specified custom localhost ports.
+  - One-click import (`POST /api/local/import` & Desktop **Scan Local Models** button) adding discovered local services as OpenAI-compatible channels with optional `offline_fallback = true`, automatically taking over with `X-Gateway-Offline-Fallback: true` when all cloud channels trip or go offline.
+- **Local Savings & Stop-Loss Telemetry Dashboard (`trajectory.rs` + `/api/analytics/savings`)**:
+  - Aggregates local SQLite WAL trajectories over `7d` / `30d` / `All Time`: total requests, sticky hits, Prompt Caching read tokens & hit rate, `aborted_by_client` Ctrl+C stop-loss count, and estimated USD savings using built-in + `[model_pricing]`-overridable pricing.
+  - Added lightweight zero-dependency CSS/SVG **Savings & Telemetry** tab in LoomGate Studio and `loomgate savings [days]` / `loomgate local scan` CLI & SDK methods.
+- **Trajectory Studio 2.0 Export & Share (`export_fork_diff_markdown` + Pure Canvas 2D PNG / Pure SVG)**:
+  - Added `POST /api/steps/export-diff`, Tauri `export_fork_diff_markdown`, and `loomgate diff-export`: reuses `GuardrailMiddleware` redaction (including `sk-*`, `Bearer <token>`, `AIza*`, `ghp_*`, `AKIA*`, emails, and CN phone numbers — enabled by default) to generate Markdown comparison reports.
+  - Added **Copy Markdown Report**, **Export SVG Card** (pure SVG, zero `<foreignObject>`), and **Export PNG Card** (pure Canvas 2D API, zero WebView2 canvas taint) in Desktop Studio.
+- Expanded `tests/conformance_suite.py` to **17/17** and Rust workspace unit tests to **25/25**.
+
 ## [0.4.0] - 2026-11-25
 
 ### Added

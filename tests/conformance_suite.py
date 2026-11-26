@@ -778,6 +778,107 @@ def test_16_local_savings_and_stop_loss_analytics():
     )
 
 
+def test_17_trajectory_studio_fork_diff_markdown_export_redacts_secrets():
+    reset_all()
+
+    # Local ephemeral upstream returning a response containing sk- & Bearer secrets
+    class SecretEchoHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length) if length > 0 else b"{}"
+            body = json.dumps(
+                {
+                    "id": "chatcmpl_secret_test",
+                    "object": "chat.completion",
+                    "model": "secret-export-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "Use sk-live-secret1234567890 and Authorization: Bearer tok_supersecret987654",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 18, "total_tokens": 68},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), SecretEchoHandler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ch_id = "secret-export-ch"
+
+    try:
+        st_up, _, _ = http_json(
+            "POST",
+            f"{GATEWAY}/api/channels",
+            {
+                "id": ch_id,
+                "protocol": "openai",
+                "base_url": f"http://127.0.0.1:{port}",
+                "api_key": "sk-dummy",
+                "weight": 100,
+                "enabled": True,
+                "models": ["secret-export-model"],
+            },
+        )
+        assert st_up == 200
+
+        st1, h1, _ = http_json(
+            "POST",
+            f"{GATEWAY}/v1/chat/completions",
+            {
+                "model": "secret-export-model",
+                "stream": False,
+                "messages": [{"role": "user", "content": "Show config example"}],
+            },
+            headers={"X-Session-Id": f"export-sess-{int(time.time())}"},
+        )
+        assert st1 == 200
+        orig_step = get_header(h1, "X-Gateway-Step-Id")
+        assert orig_step
+
+        st_fk, _, diff = http_json(
+            "POST",
+            f"{GATEWAY}/api/steps/{orig_step}/fork",
+            {"target_model": "gpt-4o"},
+        )
+        assert st_fk == 200, f"fork failed: {st_fk} {diff}"
+        fork_step = diff["forked"]["step_id"]
+
+        st_exp, _, exp = http_json(
+            "POST",
+            f"{GATEWAY}/api/steps/export-diff",
+            {
+                "original_step_id": orig_step,
+                "forked_step_id": fork_step,
+                "redact_secrets": True,
+            },
+        )
+        assert st_exp == 200, f"export-diff failed: {st_exp} {exp}"
+        md = exp["markdown"]
+        assert exp["redacted"] is True and exp["redactions_applied"] >= 2, f"expected >=2 redactions: {exp}"
+        assert "sk-live-secret1234567890" not in md, "sk- secret leaked into exported Markdown!"
+        assert "tok_supersecret987654" not in md, "Bearer token leaked into exported Markdown!"
+        assert "[REDACTED_SECRET]" in md
+        assert "## Performance & Token Comparison" in md and "```diff" in md
+        return f"redactions={exp['redactions_applied']}, sk-/Bearer scrubbed from Markdown export"
+    finally:
+        http_json("DELETE", f"{GATEWAY}/api/channels/{ch_id}")
+        srv.shutdown()
+        srv.server_close()
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -796,6 +897,7 @@ if __name__ == "__main__":
         ("14. v0.4.0 Split Auth (api_key vs admin_password)", test_14_split_api_key_and_admin_password_auth),
         ("15. v0.5.0 Local Model Auto-Discovery, Import & Offline Fallback", test_15_local_model_discovery_import_and_offline_fallback),
         ("16. v0.5.0 Local Savings & Stop-Loss Telemetry Dashboard", test_16_local_savings_and_stop_loss_analytics),
+        ("17. v0.5.0 Trajectory Studio Fork/Diff Markdown Export & Redaction", test_17_trajectory_studio_fork_diff_markdown_export_redacts_secrets),
     ]
     failed = 0
     for name, fn in tests:
