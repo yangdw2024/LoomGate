@@ -88,6 +88,44 @@ export interface MiddlewareOverview {
   }>;
 }
 
+export interface DiscoveredLocalProvider {
+  kind: "ollama" | "lm_studio" | "vllm" | "custom_openai";
+  display_name: string;
+  suggested_channel_id: string;
+  base_url: string;
+  port: number;
+  models: string[];
+  latency_ms: number;
+}
+
+export interface ModelSavingsRow {
+  model: string;
+  requests: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  cache_hit_ratio: number;
+  aborted_count: number;
+  estimated_actual_cost_usd: number;
+  estimated_cache_savings_usd: number;
+}
+
+export interface SavingsSummary {
+  window_days: number;
+  total_requests: number;
+  completed_requests: number;
+  aborted_by_client_count: number;
+  sticky_hit_count: number;
+  total_input_tokens: number;
+  total_cache_read_tokens: number;
+  total_output_tokens: number;
+  avg_cache_hit_ratio: number;
+  estimated_actual_cost_usd: number;
+  estimated_cache_savings_usd: number;
+  estimated_stop_loss_savings_usd: number;
+  by_model: ModelSavingsRow[];
+}
+
 export interface GatewayCallResult<T = unknown> {
   status: number;
   headers: Record<string, string>;
@@ -113,6 +151,16 @@ export class LoomGateClient {
   cloudLogin(controlPlaneUrl: string, email: string, password: string): Promise<CloudSessionStatus>;
   cloudSync(): Promise<CloudSessionStatus>;
   cloudLogout(): Promise<CloudSessionStatus>;
+
+  /** Local Prompt Caching & Ctrl+C stop-loss savings summary over the trailing `days` (0 = all time). */
+  savings(days?: number): Promise<SavingsSummary>;
+  /** Parallel <=400ms scan for local Ollama / LM Studio / vLLM / custom OpenAI-compatible servers. */
+  discoverLocal(customPorts?: number[]): Promise<DiscoveredLocalProvider[]>;
+  /** One-click import of a discovered local provider into the live P2C pool. */
+  importLocal(
+    provider: DiscoveredLocalProvider,
+    opts?: { channelId?: string; offlineFallback?: boolean }
+  ): Promise<ChannelSnapshot>;
 
   /** Anthropic Messages API (/v1/messages) routed through LoomGate lossless Canonical IR. */
   messages<T = Record<string, unknown>>(payload: Record<string, unknown>, opts?: RequestMetaOptions): Promise<GatewayCallResult<T>>;

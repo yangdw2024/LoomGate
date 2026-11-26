@@ -8,8 +8,10 @@ independently before reporting the final scorecard.
 """
 
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -649,6 +651,133 @@ def test_14_split_api_key_and_admin_password_auth():
         )
 
 
+def test_15_local_model_discovery_import_and_offline_fallback():
+    reset_all()
+
+    class MockOllamaHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/api/tags":
+                body = json.dumps({"models": [{"name": "qwen2.5-coder:7b"}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            req = json.loads(raw.decode("utf-8"))
+            body = json.dumps(
+                {
+                    "id": "chatcmpl_local_ollama_1",
+                    "object": "chat.completion",
+                    "model": req.get("model", "qwen2.5-coder:7b"),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "Offline Ollama reply"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    class MockLmStudioHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/v1/models":
+                body = json.dumps({"object": "list", "data": [{"id": "llama-3.3-70b-instruct"}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    ol_srv = ThreadingHTTPServer(("127.0.0.1", 0), MockOllamaHandler)
+    lm_srv = ThreadingHTTPServer(("127.0.0.1", 0), MockLmStudioHandler)
+    ol_port = ol_srv.server_address[1]
+    lm_port = lm_srv.server_address[1]
+    threading.Thread(target=ol_srv.serve_forever, daemon=True).start()
+    threading.Thread(target=lm_srv.serve_forever, daemon=True).start()
+
+    imported_id = None
+    try:
+        t0 = time.monotonic()
+        st, _, body = http_json("GET", f"{GATEWAY}/api/local/discover?ports={ol_port},{lm_port}")
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        assert st == 200, f"local discover failed: {st} {body}"
+        providers = body.get("providers", [])
+        by_port = {p["port"]: p for p in providers}
+        assert ol_port in by_port and "qwen2.5-coder:7b" in by_port[ol_port]["models"], f"ollama missing: {providers}"
+        assert lm_port in by_port and "llama-3.3-70b-instruct" in by_port[lm_port]["models"], f"lmstudio missing: {providers}"
+
+        st_imp, _, imp_body = http_json(
+            "POST",
+            f"{GATEWAY}/api/local/import",
+            {"provider": by_port[ol_port], "offline_fallback": True},
+        )
+        assert st_imp == 200 and imp_body["ok"], f"local import failed: {st_imp} {imp_body}"
+        imported_id = imp_body["channel"]["id"]
+        assert imp_body["channel"]["offline_fallback"] is True
+
+        # Trigger offline fallback by requesting a cloud model with zero healthy cloud channels
+        st_fb, h_fb, b_fb = http_json(
+            "POST",
+            f"{GATEWAY}/v1/chat/completions",
+            {
+                "model": "unavailable-cloud-model-xyz",
+                "stream": False,
+                "messages": [{"role": "user", "content": "Are we offline?"}],
+            },
+        )
+        assert st_fb == 200, f"offline fallback request failed: {st_fb} {b_fb}"
+        assert get_header(h_fb, "X-Gateway-Offline-Fallback") == "true"
+        assert get_header(h_fb, "X-Gateway-Actual-Model") == "qwen2.5-coder:7b"
+        assert "Offline Ollama reply" in b_fb["choices"][0]["message"]["content"]
+        return f"discovered Ollama+LM Studio in {elapsed_ms}ms; offline_fallback routed -> qwen2.5-coder:7b"
+    finally:
+        if imported_id:
+            http_json("DELETE", f"{GATEWAY}/api/channels/{imported_id}")
+        ol_srv.shutdown()
+        lm_srv.shutdown()
+        ol_srv.server_close()
+        lm_srv.server_close()
+
+
+def test_16_local_savings_and_stop_loss_analytics():
+    st, _, sav = http_json("GET", f"{GATEWAY}/api/analytics/savings?days=30")
+    assert st == 200, f"savings endpoint failed: {st} {sav}"
+    assert sav["total_requests"] >= 10, f"expected >=10 recorded requests, got {sav}"
+    assert sav["total_cache_read_tokens"] > 0, f"expected cache_read_tokens > 0: {sav}"
+    assert sav["avg_cache_hit_ratio"] > 0.0, f"expected positive cache hit ratio: {sav}"
+    assert sav["aborted_by_client_count"] >= 1, f"expected >=1 Ctrl+C abort recorded: {sav}"
+    assert sav["estimated_cache_savings_usd"] > 0.0, f"expected positive cache savings USD: {sav}"
+    assert sav["estimated_stop_loss_savings_usd"] > 0.0, f"expected positive stop-loss savings USD: {sav}"
+    assert len(sav["by_model"]) >= 2, f"expected multi-model breakdown: {sav}"
+    return (
+        f"reqs={sav['total_requests']}, cache_hit={sav['avg_cache_hit_ratio']*100:.1f}%, "
+        f"aborts={sav['aborted_by_client_count']}, cache_saved=${sav['estimated_cache_savings_usd']:.5f}"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -665,6 +794,8 @@ if __name__ == "__main__":
         ("12. v0.4.0 Claude CLI Preflight count_tokens", test_12_claude_cli_preflight_count_tokens),
         ("13. v0.4.0 Declarative Client Registry & Live Channel CRUD/Probe", test_13_declarative_client_registry_and_live_channel_crud),
         ("14. v0.4.0 Split Auth (api_key vs admin_password)", test_14_split_api_key_and_admin_password_auth),
+        ("15. v0.5.0 Local Model Auto-Discovery, Import & Offline Fallback", test_15_local_model_discovery_import_and_offline_fallback),
+        ("16. v0.5.0 Local Savings & Stop-Loss Telemetry Dashboard", test_16_local_savings_and_stop_loss_analytics),
     ]
     failed = 0
     for name, fn in tests:

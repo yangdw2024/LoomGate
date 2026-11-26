@@ -7,10 +7,10 @@ use axum::{
     Json, Router,
 };
 use gateway_core::{
-    AuthSettings, ChannelConfig, ChannelSnapshot, ChannelTestResult, CliIntegrationStatus,
-    CliTakeoverManager, CliTool, ClientProfileStatus, CloudSessionStatus, ForkDiffResult,
-    GatewayConfig, GatewayEngine, GatewayError, GatewayResponse, RouteMode, SessionSummary,
-    TrajectoryStep, UpstreamProtocol,
+    discover_local_providers, AuthSettings, ChannelConfig, ChannelSnapshot, ChannelTestResult,
+    CliIntegrationStatus, CliTakeoverManager, CliTool, ClientProfileStatus, CloudSessionStatus,
+    DiscoveredLocalProvider, ForkDiffResult, GatewayConfig, GatewayEngine, GatewayError,
+    GatewayResponse, RouteMode, SavingsSummary, SessionSummary, TrajectoryStep, UpstreamProtocol,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -289,6 +289,38 @@ async fn test_channel_connection(
     channel: ChannelConfig,
 ) -> Result<ChannelTestResult, String> {
     Ok(state.engine.test_channel_connection(channel).await)
+}
+
+#[tauri::command]
+async fn scan_local_providers(
+    custom_ports: Option<Vec<u16>>,
+) -> Result<Vec<DiscoveredLocalProvider>, String> {
+    let ports = custom_ports.unwrap_or_default();
+    Ok(discover_local_providers(&ports).await)
+}
+
+#[tauri::command]
+fn import_local_provider(
+    state: TauriState<'_, DesktopState>,
+    provider: DiscoveredLocalProvider,
+    channel_id: Option<String>,
+    offline_fallback: bool,
+) -> Result<ChannelSnapshot, String> {
+    state
+        .engine
+        .import_local_provider(&provider, channel_id, offline_fallback)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_savings_summary(
+    state: TauriState<'_, DesktopState>,
+    days: u32,
+) -> Result<SavingsSummary, String> {
+    state
+        .engine
+        .get_savings_summary(days)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -624,6 +656,7 @@ fn load_config_and_db() -> (GatewayConfig, PathBuf, PathBuf) {
         routing: Default::default(),
         error_governance: Default::default(),
         middleware: Default::default(),
+        model_pricing: Default::default(),
         channels: vec![],
     });
     let db_path = std::env::var("GATEWAY_DB_PATH")
@@ -741,6 +774,9 @@ pub fn run() {
             delete_channel,
             toggle_channel,
             test_channel_connection,
+            scan_local_providers,
+            import_local_provider,
+            get_savings_summary,
             list_client_profiles,
             takeover_client_profile,
             restore_client_profile,

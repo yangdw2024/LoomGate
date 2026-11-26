@@ -17,6 +17,16 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricing {
+    /// Input token price in USD per 1M tokens.
+    pub input_per_1m_usd: f64,
+    /// Prompt cache read token price in USD per 1M tokens.
+    pub cache_read_per_1m_usd: f64,
+    /// Output token price in USD per 1M tokens.
+    pub output_per_1m_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -26,6 +36,9 @@ pub struct GatewayConfig {
     pub error_governance: ErrorGovernanceConfig,
     #[serde(default)]
     pub middleware: MiddlewareConfig,
+    /// Optional per-model USD pricing overrides for the local Savings & Telemetry calculator.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_pricing: HashMap<String, ModelPricing>,
     #[serde(default)]
     pub channels: Vec<ChannelConfig>,
 }
@@ -257,6 +270,10 @@ pub struct ChannelConfig {
     /// Optional upstream quota / balance probe endpoint URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_endpoint: Option<String>,
+    /// Marks this channel (typically Ollama / LM Studio / vLLM) as an offline fallback target
+    /// automatically used when all cloud/primary channels are tripped or unreachable.
+    #[serde(default)]
+    pub offline_fallback: bool,
 }
 
 fn default_weight() -> u32 {
@@ -431,6 +448,7 @@ models = ["gpt-4o-mini"]
             routing: Default::default(),
             error_governance: Default::default(),
             middleware: Default::default(),
+            model_pricing: HashMap::new(),
             channels: vec![ChannelConfig {
                 id: "ch1".into(),
                 protocol: UpstreamProtocol::OpenAi,
@@ -443,6 +461,7 @@ models = ["gpt-4o-mini"]
                 proxy_url: Some("socks5h://127.0.0.1:1080".into()),
                 fallback_models: vec!["gpt-4o-mini".into()],
                 quota_endpoint: Some("https://api.openai.com/dashboard/billing/usage".into()),
+                offline_fallback: false,
             }],
         };
         cfg.channels[0].normalize();

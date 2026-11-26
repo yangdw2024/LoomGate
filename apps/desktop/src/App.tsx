@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-type TabId = "channels" | "takeover" | "trajectory";
+type TabId = "channels" | "takeover" | "trajectory" | "savings";
 
 interface ChannelSnapshot {
   id: string;
@@ -14,6 +14,7 @@ interface ChannelSnapshot {
   proxy_url: string | null;
   fallback_models: string[];
   quota_endpoint: string | null;
+  offline_fallback: boolean;
   health: "healthy" | "cooldown" | "quarantined";
   cooldown_remaining_secs: number;
   quarantine_remaining_secs: number;
@@ -34,6 +35,45 @@ interface ChannelConfig {
   proxy_url?: string | null;
   fallback_models: string[];
   quota_endpoint?: string | null;
+  offline_fallback: boolean;
+}
+
+interface DiscoveredLocalProvider {
+  kind: "ollama" | "lm_studio" | "vllm" | "custom_openai";
+  display_name: string;
+  suggested_channel_id: string;
+  base_url: string;
+  port: number;
+  models: string[];
+  latency_ms: number;
+}
+
+interface ModelSavingsRow {
+  model: string;
+  requests: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  cache_hit_ratio: number;
+  aborted_count: number;
+  estimated_actual_cost_usd: number;
+  estimated_cache_savings_usd: number;
+}
+
+interface SavingsSummary {
+  window_days: number;
+  total_requests: number;
+  completed_requests: number;
+  aborted_by_client_count: number;
+  sticky_hit_count: number;
+  total_input_tokens: number;
+  total_cache_read_tokens: number;
+  total_output_tokens: number;
+  avg_cache_hit_ratio: number;
+  estimated_actual_cost_usd: number;
+  estimated_cache_savings_usd: number;
+  estimated_stop_loss_savings_usd: number;
+  by_model: ModelSavingsRow[];
 }
 
 interface ChannelTestResult {
@@ -175,6 +215,7 @@ const emptyChannelForm = () => ({
   proxy_url: "",
   fallbackText: "",
   quota_endpoint: "",
+  offline_fallback: false,
 });
 
 export default function App() {
@@ -187,6 +228,14 @@ export default function App() {
   const [chForm, setChForm] = useState(emptyChannelForm);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, ChannelTestResult>>({});
+
+  const [scanningLocal, setScanningLocal] = useState(false);
+  const [localCustomPorts, setLocalCustomPorts] = useState("");
+  const [discoveredLocals, setDiscoveredLocals] = useState<DiscoveredLocalProvider[]>([]);
+  const [importAsOfflineFallback, setImportAsOfflineFallback] = useState(true);
+
+  const [savingsDays, setSavingsDays] = useState<number>(30);
+  const [savings, setSavings] = useState<SavingsSummary | null>(null);
 
   const [profiles, setProfiles] = useState<ClientProfileStatus[]>([]);
   const [selectedWizardId, setSelectedWizardId] = useState<string>("cursor");
@@ -233,6 +282,8 @@ export default function App() {
 
     const sessList = await invoke<SessionSummary[]>("list_sessions");
     setSessions(sessList);
+    const sav = await invoke<SavingsSummary>("get_savings_summary", { days: savingsDays });
+    setSavings(sav);
     if (selectedSession) {
       const st = await invoke<TrajectoryStep[]>("get_session_steps", {
         sessionId: selectedSession,
@@ -275,7 +326,7 @@ export default function App() {
       clearInterval(timer);
       if (unlisten) unlisten();
     };
-  }, [selectedSession]);
+  }, [selectedSession, savingsDays]);
 
   async function switchMode(mode: "lock" | "stage_aware") {
     if (!isTauri()) return;
@@ -303,6 +354,7 @@ export default function App() {
       proxy_url: existing.proxy_url ?? "",
       fallbackText: (existing.fallback_models ?? []).join(", "),
       quota_endpoint: existing.quota_endpoint ?? "",
+      offline_fallback: Boolean(existing.offline_fallback),
     });
     setShowChannelForm(true);
   }
@@ -325,7 +377,51 @@ export default function App() {
       proxy_url: chForm.proxy_url.trim() || null,
       fallback_models: splitCsv(chForm.fallbackText),
       quota_endpoint: chForm.quota_endpoint.trim() || null,
+      offline_fallback: chForm.offline_fallback,
     };
+  }
+
+  async function handleScanLocalProviders() {
+    if (!isTauri()) return;
+    setScanningLocal(true);
+    try {
+      const customPorts = localCustomPorts
+        .split(",")
+        .map((s) => Number(s.trim()))
+        .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535);
+      const found = await invoke<DiscoveredLocalProvider[]>("scan_local_providers", {
+        customPorts,
+      });
+      setDiscoveredLocals(found);
+      setNotice(
+        found.length > 0
+          ? `Discovered ${found.length} local inference service(s).`
+          : "No local Ollama (11434) / LM Studio (1234) / vLLM (8000) services responded within 350ms."
+      );
+    } catch (e) {
+      setNotice(`Local scan failed: ${String(e)}`);
+    } finally {
+      setScanningLocal(false);
+    }
+  }
+
+  async function handleImportLocalProvider(provider: DiscoveredLocalProvider) {
+    if (!isTauri()) return;
+    try {
+      const ch = await invoke<ChannelSnapshot>("import_local_provider", {
+        provider,
+        channelId: null,
+        offlineFallback: importAsOfflineFallback,
+      });
+      await refreshAll();
+      setNotice(
+        `Imported '${ch.id}' (${ch.models.length} model(s))${
+          ch.offline_fallback ? " as Offline Fallback" : ""
+        } and persisted to config.local.toml.`
+      );
+    } catch (e) {
+      setNotice(`Import local provider failed: ${String(e)}`);
+    }
   }
 
   async function handleSaveChannel() {
@@ -552,6 +648,12 @@ export default function App() {
           >
             Trajectory Fork &amp; Diff
           </button>
+          <button
+            className={`tab ${tab === "savings" ? "active" : ""}`}
+            onClick={() => setTab("savings")}
+          >
+            Savings &amp; Telemetry
+          </button>
         </div>
       </header>
 
@@ -591,12 +693,66 @@ export default function App() {
             </div>
 
             <div className="card">
-              <div className="row" style={{ marginBottom: 12 }}>
+              <div className="row" style={{ marginBottom: 12, flexWrap: "wrap" }}>
                 <h3 style={{ margin: 0 }}>P2C Upstream Channel Pool (Hot-Editable → config.local.toml)</h3>
-                <button className="btn" onClick={openNewChannelForm}>
-                  + Add Channel
-                </button>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <input
+                    style={{ width: 160 }}
+                    value={localCustomPorts}
+                    onChange={(e) => setLocalCustomPorts(e.target.value)}
+                    placeholder="Extra ports (e.g. 8080)"
+                  />
+                  <button
+                    className="btn secondary"
+                    disabled={scanningLocal}
+                    onClick={handleScanLocalProviders}
+                  >
+                    {scanningLocal ? "Scanning..." : "Scan Local Models (Ollama / LM Studio / vLLM)"}
+                  </button>
+                  <button className="btn" onClick={openNewChannelForm}>
+                    + Add Channel
+                  </button>
+                </div>
               </div>
+
+              {discoveredLocals.length > 0 && (
+                <div
+                  className="card"
+                  style={{ borderColor: "var(--ok)", background: "var(--bg)", marginBottom: 14 }}
+                >
+                  <div className="row" style={{ marginBottom: 8, flexWrap: "wrap" }}>
+                    <strong>Discovered Local Inference Runtimes</strong>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                      <input
+                        type="checkbox"
+                        checked={importAsOfflineFallback}
+                        onChange={(e) => setImportAsOfflineFallback(e.target.checked)}
+                      />
+                      Import as Offline Fallback (auto-takes over if cloud channels trip/offline)
+                    </label>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {discoveredLocals.map((loc) => (
+                      <div key={`${loc.kind}-${loc.port}`} className="row" style={{ flexWrap: "wrap" }}>
+                        <div>
+                          <strong>{loc.display_name}</strong>{" "}
+                          <span className="pill ok">{loc.latency_ms} ms</span>{" "}
+                          <span style={{ color: "var(--muted)", fontFamily: "monospace", fontSize: 12 }}>
+                            {loc.base_url}
+                          </span>
+                          <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>
+                            Models ({loc.models.length}):{" "}
+                            {loc.models.length > 0 ? loc.models.join(", ") : "(none reported)"}
+                          </div>
+                        </div>
+                        <button className="btn" onClick={() => handleImportLocalProvider(loc)}>
+                          One-Click Import
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {showChannelForm && (
                 <div
@@ -707,15 +863,27 @@ export default function App() {
                       />
                     </label>
                   </div>
-                  <div className="row" style={{ marginTop: 12 }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
-                      <input
-                        type="checkbox"
-                        checked={chForm.enabled}
-                        onChange={(e) => setChForm({ ...chForm, enabled: e.target.checked })}
-                      />
-                      Enabled in P2C pool
-                    </label>
+                  <div className="row" style={{ marginTop: 12, flexWrap: "wrap" }}>
+                    <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                        <input
+                          type="checkbox"
+                          checked={chForm.enabled}
+                          onChange={(e) => setChForm({ ...chForm, enabled: e.target.checked })}
+                        />
+                        Enabled in P2C pool
+                      </label>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                        <input
+                          type="checkbox"
+                          checked={chForm.offline_fallback}
+                          onChange={(e) =>
+                            setChForm({ ...chForm, offline_fallback: e.target.checked })
+                          }
+                        />
+                        Offline Fallback (when cloud channels are down)
+                      </label>
+                    </div>
                     <div style={{ display: "flex", gap: 8 }}>
                       <button
                         className="btn secondary"
@@ -758,7 +926,8 @@ export default function App() {
                     return (
                       <tr key={ch.id} style={{ opacity: ch.enabled ? 1 : 0.6 }}>
                         <td>
-                          <strong>{ch.id}</strong>
+                          <strong>{ch.id}</strong>{" "}
+                          {ch.offline_fallback && <span className="pill ok">Offline Fallback</span>}
                           {ch.proxy_url && (
                             <div style={{ fontSize: 11, color: "var(--muted)" }}>
                               proxy: {ch.proxy_url}
@@ -1283,6 +1452,155 @@ export default function App() {
               })}
             </div>
           </div>
+        )}
+
+        {tab === "savings" && (
+          <>
+            <div className="card row">
+              <div>
+                <h3 style={{ margin: 0 }}>Local Prompt Caching Savings &amp; Stop-Loss Telemetry</h3>
+                <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                  Computed 100% locally from SQLite WAL trajectories — zero raw prompts leave your machine.
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                {[
+                  { label: "7 Days", days: 7 },
+                  { label: "30 Days", days: 30 },
+                  { label: "All Time", days: 0 },
+                ].map((w) => (
+                  <button
+                    key={w.days}
+                    className={`btn ${savingsDays === w.days ? "" : "secondary"}`}
+                    onClick={() => setSavingsDays(w.days)}
+                  >
+                    {w.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="kpi-grid">
+              <div className="kpi-card">
+                <div className="kpi-label">Total Requests</div>
+                <div className="kpi-value">{savings?.total_requests ?? 0}</div>
+                <div className="kpi-sub">
+                  Sticky hits: {savings?.sticky_hit_count ?? 0} · Completed:{" "}
+                  {savings?.completed_requests ?? 0}
+                </div>
+              </div>
+              <div className="kpi-card">
+                <div className="kpi-label">Prompt Cache Hit Rate</div>
+                <div className="kpi-value" style={{ color: "var(--ok)" }}>
+                  {((savings?.avg_cache_hit_ratio ?? 0) * 100).toFixed(1)}%
+                </div>
+                <div className="kpi-sub">
+                  Cache read tokens: {(savings?.total_cache_read_tokens ?? 0).toLocaleString()}
+                </div>
+              </div>
+              <div className="kpi-card">
+                <div className="kpi-label">Estimated Cache Savings</div>
+                <div className="kpi-value" style={{ color: "var(--ok)" }}>
+                  ${(savings?.estimated_cache_savings_usd ?? 0).toFixed(4)}
+                </div>
+                <div className="kpi-sub">
+                  Est. actual spend: ${(savings?.estimated_actual_cost_usd ?? 0).toFixed(4)}
+                </div>
+              </div>
+              <div className="kpi-card">
+                <div className="kpi-label">Ctrl+C Stop-Loss Aborts</div>
+                <div className="kpi-value" style={{ color: "var(--warn)" }}>
+                  {savings?.aborted_by_client_count ?? 0}
+                </div>
+                <div className="kpi-sub">
+                  Est. stop-loss saved: ${(savings?.estimated_stop_loss_savings_usd ?? 0).toFixed(4)}
+                </div>
+              </div>
+            </div>
+
+            <div className="card">
+              <h3>Model Distribution &amp; Cache Hit Efficiency</h3>
+              {savings && savings.by_model.length > 0 ? (
+                <>
+                  <svg
+                    width="100%"
+                    height={savings.by_model.length * 36 + 16}
+                    style={{ display: "block", marginBottom: 14 }}
+                  >
+                    {(() => {
+                      const maxReq = Math.max(...savings.by_model.map((m) => m.requests), 1);
+                      return savings.by_model.map((m, idx) => {
+                        const y = idx * 36 + 8;
+                        const pctWidth = Math.max(4, Math.round((m.requests / maxReq) * 55));
+                        const hitPct = Math.round(m.cache_hit_ratio * 100);
+                        return (
+                          <g key={m.model} transform={`translate(0, ${y})`}>
+                            <text x="0" y="16" fill="#e6edf3" fontSize="12" fontFamily="monospace">
+                              {m.model.slice(0, 28)}
+                            </text>
+                            <rect
+                              x="230"
+                              y="5"
+                              width={`${pctWidth}%`}
+                              height="14"
+                              rx="4"
+                              fill={hitPct >= 50 ? "#3fb950" : "#388bfd"}
+                            />
+                            <text x="82%" y="16" fill="#8b949e" fontSize="12">
+                              {m.requests} req · KV {hitPct}% · ${m.estimated_cache_savings_usd.toFixed(4)} saved
+                            </text>
+                          </g>
+                        );
+                      });
+                    })()}
+                  </svg>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Model</th>
+                        <th>Requests</th>
+                        <th>Input Tokens</th>
+                        <th>Cache Read Tokens</th>
+                        <th>KV Hit %</th>
+                        <th>Aborts</th>
+                        <th>Est. Cache Saved</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {savings.by_model.map((row) => (
+                        <tr key={row.model}>
+                          <td style={{ fontFamily: "monospace", fontSize: 12 }}>{row.model}</td>
+                          <td>{row.requests}</td>
+                          <td>{row.input_tokens.toLocaleString()}</td>
+                          <td>{row.cache_read_tokens.toLocaleString()}</td>
+                          <td style={{ minWidth: 110 }}>
+                            <div style={{ fontSize: 12, marginBottom: 3 }}>
+                              {(row.cache_hit_ratio * 100).toFixed(1)}%
+                            </div>
+                            <div className="bar-track">
+                              <div
+                                className={`bar-fill ${row.cache_hit_ratio >= 0.5 ? "ok" : ""}`}
+                                style={{ width: `${Math.round(row.cache_hit_ratio * 100)}%` }}
+                              />
+                            </div>
+                          </td>
+                          <td>{row.aborted_count}</td>
+                          <td style={{ color: "var(--ok)" }}>
+                            ${row.estimated_cache_savings_usd.toFixed(4)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </>
+              ) : (
+                <p style={{ color: "var(--muted)" }}>
+                  No trajectory samples in this window yet. Route requests through {bindAddr} to
+                  see real-time cache savings and stop-loss telemetry.
+                </p>
+              )}
+            </div>
+          </>
         )}
       </main>
     </div>

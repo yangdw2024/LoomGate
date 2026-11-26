@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -8,8 +8,9 @@ use axum::{
     Json, Router,
 };
 use gateway_core::{
-    AuthSettings, ChannelConfig, CliTakeoverManager, GatewayConfig, GatewayEngine, GatewayError,
-    GatewayResponse, RouteMode, UpstreamProtocol,
+    discover_local_providers, AuthSettings, ChannelConfig, CliTakeoverManager,
+    DiscoveredLocalProvider, GatewayConfig, GatewayEngine, GatewayError, GatewayResponse,
+    RouteMode, UpstreamProtocol,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,6 +46,31 @@ struct CloudLoginRequest {
 #[derive(Deserialize)]
 struct ToggleChannelRequest {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct DiscoverLocalQuery {
+    #[serde(default)]
+    ports: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportLocalRequest {
+    provider: DiscoveredLocalProvider,
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    offline_fallback: bool,
+}
+
+#[derive(Deserialize)]
+struct SavingsQuery {
+    #[serde(default = "default_savings_days")]
+    days: u32,
+}
+
+fn default_savings_days() -> u32 {
+    30
 }
 
 fn extract_admin_credential(headers: &HeaderMap) -> Option<&str> {
@@ -137,6 +163,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/channels/test", post(test_channel))
         .route("/api/channels/:id", delete(delete_channel))
         .route("/api/channels/:id/toggle", post(toggle_channel))
+        .route("/api/local/discover", get(local_discover))
+        .route("/api/local/import", post(local_import))
+        .route("/api/analytics/savings", get(analytics_savings))
         .route("/api/clients", get(list_clients))
         .route("/api/auth/settings", get(get_auth_settings).post(set_auth_settings))
         .route_layer(middleware::from_fn_with_state(
@@ -236,6 +265,48 @@ async fn test_channel(
 ) -> impl IntoResponse {
     let result = state.engine.test_channel_connection(cfg).await;
     Json(result)
+}
+
+async fn local_discover(Query(q): Query<DiscoverLocalQuery>) -> impl IntoResponse {
+    let custom_ports: Vec<u16> = q
+        .ports
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u16>().ok())
+        .collect();
+    let providers = discover_local_providers(&custom_ports).await;
+    Json(json!({ "providers": providers }))
+}
+
+async fn local_import(
+    State(state): State<AppState>,
+    Json(req): Json<ImportLocalRequest>,
+) -> impl IntoResponse {
+    match state
+        .engine
+        .import_local_provider(&req.provider, req.channel_id, req.offline_fallback)
+    {
+        Ok(channel) => Json(json!({ "ok": true, "channel": channel })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn analytics_savings(
+    State(state): State<AppState>,
+    Query(q): Query<SavingsQuery>,
+) -> impl IntoResponse {
+    match state.engine.get_savings_summary(q.days) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_clients(State(state): State<AppState>) -> impl IntoResponse {

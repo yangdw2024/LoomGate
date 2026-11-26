@@ -3,6 +3,7 @@ use crate::codec::{codec_for, CodecError};
 use crate::config::{ChannelConfig, ConfigError, GatewayConfig, RouteMode, UpstreamProtocol};
 use crate::error_gov::{classify_upstream_error, ErrorTier};
 use crate::ir::{CanonicalRequest, CanonicalStreamEvent, CanonicalUsage, ContentPart};
+use crate::local_discovery::{build_local_channel_config, DiscoveredLocalProvider};
 use crate::middleware::guardrail::GuardrailMiddleware;
 use crate::middleware::ingress::IngressRateLimitMiddleware;
 use crate::middleware::mcp_bridge::McpBridgeMiddleware;
@@ -12,8 +13,8 @@ use crate::router::{ChannelRuntime, ChannelSnapshot, StickyP2cRouter};
 use crate::signature_cache::SignatureCache;
 use crate::sse_fsm::{CancelPropagatingStream, SseFrameParser, StreamMetrics};
 use crate::trajectory::{
-    new_step_id, now_epoch_ms, ForkDiffResult, SessionSummary, TrajectoryError, TrajectoryStep,
-    TrajectoryStore,
+    new_step_id, now_epoch_ms, ForkDiffResult, SavingsSummary, SessionSummary, TrajectoryError,
+    TrajectoryStep, TrajectoryStore,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -434,6 +435,23 @@ impl GatewayEngine {
             .ok_or_else(|| GatewayError::NoAvailableChannel(id.to_string()))?;
         self.persist_local_config()?;
         Ok(snap)
+    }
+
+    /// Imports a discovered local inference provider (Ollama / LM Studio / vLLM / custom) into
+    /// the live P2C pool as an OpenAI-compatible channel and atomically persists `config.local.toml`.
+    pub fn import_local_provider(
+        &self,
+        provider: &DiscoveredLocalProvider,
+        channel_id_override: Option<String>,
+        offline_fallback: bool,
+    ) -> Result<ChannelSnapshot, GatewayError> {
+        let cfg = build_local_channel_config(provider, channel_id_override, offline_fallback);
+        self.upsert_channel(cfg)
+    }
+
+    pub fn get_savings_summary(&self, days: u32) -> Result<SavingsSummary, TrajectoryError> {
+        self.trajectory
+            .get_savings_summary(days, &self.config.model_pricing)
     }
 
     fn http_client_for_channel(&self, cfg: &ChannelConfig) -> Result<Client, GatewayError> {
@@ -1016,6 +1034,10 @@ impl GatewayEngine {
                             channel.record_ttft(ttft_ms);
                         }
 
+                        let mut extra_headers = BTreeMap::new();
+                        if decision.offline_fallback_used {
+                            extra_headers.insert("X-Gateway-Offline-Fallback".into(), "true".into());
+                        }
                         let meta = ResponseMetadata {
                             request_id: request_id.clone(),
                             step_id: step_id.clone(),
@@ -1024,7 +1046,7 @@ impl GatewayEngine {
                             route_mode: decision.mode,
                             sticky_hit: decision.sticky_hit,
                             prefix_key: decision.prefix_key.clone(),
-                            extra_headers: BTreeMap::new(),
+                            extra_headers,
                         };
 
                         let traj_session = canonical

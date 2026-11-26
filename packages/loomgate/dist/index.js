@@ -116,6 +116,25 @@ export class LoomGateClient {
     return res.cloud;
   }
 
+  savings(days = 30) {
+    return this._mustOk("GET", `/api/analytics/savings?days=${encodeURIComponent(String(days))}`);
+  }
+
+  async discoverLocal(customPorts = []) {
+    const q = customPorts.length > 0 ? `?ports=${encodeURIComponent(customPorts.join(","))}` : "";
+    const res = await this._mustOk("GET", `/api/local/discover${q}`);
+    return res.providers || [];
+  }
+
+  async importLocal(provider, opts = {}) {
+    const res = await this._mustOk("POST", "/api/local/import", {
+      provider,
+      channel_id: opts.channelId ?? null,
+      offline_fallback: Boolean(opts.offlineFallback),
+    });
+    return res.channel;
+  }
+
   messages(payload, opts = {}) {
     return this._request("POST", "/v1/messages", payload, opts);
   }

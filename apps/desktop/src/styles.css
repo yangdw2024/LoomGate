@@ -93,6 +93,23 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 }
 .status-dot.lock { background: var(--accent); box-shadow: 0 0 6px rgba(56,139,253,0.7); }
 .status-dot.stage { background: var(--ok); box-shadow: 0 0 6px rgba(63,185,80,0.7); }
+.kpi-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px; margin-bottom: 14px;
+}
+.kpi-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px;
+}
+.kpi-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.kpi-value { font-size: 22px; font-weight: 700; color: var(--text); }
+.kpi-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.bar-track {
+  height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden;
+  border: 1px solid var(--border);
+}
+.bar-fill { height: 100%; border-radius: 999px; background: var(--accent); }
+.bar-fill.ok { background: var(--ok); }
 pre {
   background: #090c10; border: 1px solid var(--border); border-radius: 6px;
   padding: 10px; overflow: auto; max-height: 240px; white-space: pre-wrap; font-size: 12px;

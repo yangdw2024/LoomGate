@@ -137,6 +137,7 @@ impl ChannelRuntime {
             proxy_url: self.config.proxy_url.clone(),
             fallback_models: self.config.fallback_models.clone(),
             quota_endpoint: self.config.quota_endpoint.clone(),
+            offline_fallback: self.config.offline_fallback,
             health: self.health(),
             cooldown_remaining_secs: self.cooldown_remaining_secs(),
             quarantine_remaining_secs: self.quarantine_remaining_secs(),
@@ -158,6 +159,7 @@ pub struct ChannelSnapshot {
     pub proxy_url: Option<String>,
     pub fallback_models: Vec<String>,
     pub quota_endpoint: Option<String>,
+    pub offline_fallback: bool,
     pub health: ChannelHealth,
     pub cooldown_remaining_secs: u64,
     pub quarantine_remaining_secs: u64,
@@ -179,6 +181,7 @@ pub struct RouteDecision {
     pub mode: RouteMode,
     pub sticky_hit: bool,
     pub prefix_key: String,
+    pub offline_fallback_used: bool,
 }
 
 /// Prefix-Cache Sticky + P2C Concurrency-Aware Router with Explicit Lock / Stage-Aware Modes.
@@ -339,20 +342,37 @@ impl StickyP2cRouter {
                         mode,
                         sticky_hit: true,
                         prefix_key,
+                        offline_fallback_used: false,
                     });
                 }
             }
         }
 
         let mut resolved_model = actual_model.clone();
+        let mut offline_fallback_used = false;
+
+        // Prefer non-offline-fallback channels first when matching requested model;
+        // if the user directly requested a local model, include local channels that explicitly list it.
         let mut candidates: Vec<&Arc<ChannelRuntime>> = channels_guard
             .iter()
             .filter(|c| {
                 c.is_available()
+                    && !c.config.offline_fallback
                     && c.config.supports_model(&resolved_model)
                     && !excluded_ids.contains(&c.config.id)
             })
             .collect();
+
+        if candidates.is_empty() {
+            candidates = channels_guard
+                .iter()
+                .filter(|c| {
+                    c.is_available()
+                        && c.config.supports_model(&resolved_model)
+                        && !excluded_ids.contains(&c.config.id)
+                })
+                .collect();
+        }
 
         // Explicit fallback_models chain (ONLY active in StageAware mode — Lock mode NEVER silently downgrades).
         if candidates.is_empty() && mode == RouteMode::StageAware {
@@ -375,6 +395,30 @@ impl StickyP2cRouter {
                     candidates = fb_candidates;
                     break;
                 }
+            }
+        }
+
+        // Offline Fallback: when ALL primary/cloud channels are tripped/unavailable/excluded,
+        // transparently fail over to any healthy channel explicitly marked `offline_fallback = true`.
+        if candidates.is_empty() {
+            let offline_candidates: Vec<&Arc<ChannelRuntime>> = channels_guard
+                .iter()
+                .filter(|c| {
+                    c.is_available()
+                        && c.config.offline_fallback
+                        && !excluded_ids.contains(&c.config.id)
+                })
+                .collect();
+            if !offline_candidates.is_empty() {
+                let first_local_model = offline_candidates[0]
+                    .config
+                    .models
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| actual_model.clone());
+                resolved_model = first_local_model;
+                candidates = offline_candidates;
+                offline_fallback_used = true;
             }
         }
 
@@ -410,6 +454,7 @@ impl StickyP2cRouter {
             mode,
             sticky_hit: false,
             prefix_key,
+            offline_fallback_used,
         })
     }
 
@@ -477,6 +522,7 @@ mod tests {
                 proxy_url: None,
                 fallback_models: vec![],
                 quota_endpoint: None,
+                offline_fallback: false,
             },
             ChannelConfig {
                 id: "ch-b".into(),
@@ -490,6 +536,7 @@ mod tests {
                 proxy_url: None,
                 fallback_models: vec![],
                 quota_endpoint: None,
+                offline_fallback: false,
             },
         ];
         let router = StickyP2cRouter::new(channels, RoutingConfig::default());

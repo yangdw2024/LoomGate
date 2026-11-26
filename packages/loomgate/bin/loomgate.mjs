@@ -9,6 +9,8 @@ Usage:
   loomgate sessions                              List local SQLite trajectory sessions
   loomgate steps <session_id>                    List turns/steps in a session
   loomgate fork <step_id> <target_model>         Fork & diff a historical step on another model
+  loomgate savings [days]                        Show Prompt Caching & Ctrl+C stop-loss savings (default: 30d)
+  loomgate local scan [ports_csv]                Scan localhost for Ollama / LM Studio / vLLM runtimes
   loomgate mcp list                              List aggregated MCP tools & middleware layers
   loomgate mcp call <tool> [json_args]           Invoke a bridged MCP tool
   loomgate cloud status                          Show Cloud Control Plane connection status
@@ -47,6 +49,17 @@ async function main() {
       console.log(JSON.stringify(await client.sessionSteps(sub), null, 2));
     } else if (cmd === "fork" && sub && a1) {
       console.log(JSON.stringify(await client.forkStep(sub, a1), null, 2));
+    } else if (cmd === "savings") {
+      const days = sub !== undefined ? Number(sub) : 30;
+      console.log(JSON.stringify(await client.savings(Number.isFinite(days) ? days : 30), null, 2));
+    } else if (cmd === "local" && sub === "scan") {
+      const ports = a1
+        ? a1
+            .split(",")
+            .map((p) => Number(p.trim()))
+            .filter((n) => Number.isInteger(n) && n > 0)
+        : [];
+      console.log(JSON.stringify(await client.discoverLocal(ports), null, 2));
     } else if (cmd === "mcp" && sub === "list") {
       console.log(JSON.stringify(await client.middleware(), null, 2));
     } else if (cmd === "mcp" && sub === "call" && a1) {

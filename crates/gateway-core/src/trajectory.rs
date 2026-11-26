@@ -1,5 +1,7 @@
+use crate::config::ModelPricing;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +74,117 @@ pub struct ForkDiffResult {
     pub ttft_delta_ms: i64,
     pub output_tokens_delta: i64,
     pub cache_hit_ratio_delta: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSavingsRow {
+    pub model: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_hit_ratio: f64,
+    pub aborted_count: u64,
+    pub estimated_actual_cost_usd: f64,
+    pub estimated_cache_savings_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavingsSummary {
+    pub window_days: u32,
+    pub total_requests: u64,
+    pub completed_requests: u64,
+    pub aborted_by_client_count: u64,
+    pub sticky_hit_count: u64,
+    pub total_input_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_output_tokens: u64,
+    pub avg_cache_hit_ratio: f64,
+    pub estimated_actual_cost_usd: f64,
+    pub estimated_cache_savings_usd: f64,
+    pub estimated_stop_loss_savings_usd: f64,
+    pub by_model: Vec<ModelSavingsRow>,
+}
+
+/// Built-in conservative USD per-1M-token pricing table (overridable via `[model_pricing]` in TOML).
+pub fn resolve_model_pricing(
+    model: &str,
+    overrides: &HashMap<String, ModelPricing>,
+) -> ModelPricing {
+    if let Some(p) = overrides.get(model) {
+        return p.clone();
+    }
+    let lower = model.to_lowercase();
+    if let Some((_, p)) = overrides
+        .iter()
+        .find(|(k, _)| lower.contains(&k.to_lowercase()))
+    {
+        return p.clone();
+    }
+
+    // Local self-hosted models (Ollama / LM Studio / vLLM conventions) cost $0/token
+    if lower.contains(':')
+        || lower.starts_with("llama")
+        || lower.starts_with("qwen")
+        || lower.starts_with("deepseek-r1:")
+        || lower.starts_with("mistral")
+    {
+        return ModelPricing {
+            input_per_1m_usd: 0.0,
+            cache_read_per_1m_usd: 0.0,
+            output_per_1m_usd: 0.0,
+        };
+    }
+
+    if lower.contains("opus") {
+        ModelPricing {
+            input_per_1m_usd: 15.0,
+            cache_read_per_1m_usd: 1.5,
+            output_per_1m_usd: 75.0,
+        }
+    } else if lower.contains("sonnet") {
+        ModelPricing {
+            input_per_1m_usd: 3.0,
+            cache_read_per_1m_usd: 0.3,
+            output_per_1m_usd: 15.0,
+        }
+    } else if lower.contains("haiku") {
+        ModelPricing {
+            input_per_1m_usd: 0.8,
+            cache_read_per_1m_usd: 0.08,
+            output_per_1m_usd: 4.0,
+        }
+    } else if lower.contains("gpt-4o-mini") || lower.contains("o3-mini") {
+        ModelPricing {
+            input_per_1m_usd: 0.15,
+            cache_read_per_1m_usd: 0.075,
+            output_per_1m_usd: 0.6,
+        }
+    } else if lower.contains("gpt-4o") || lower.contains("gpt-4") {
+        ModelPricing {
+            input_per_1m_usd: 2.5,
+            cache_read_per_1m_usd: 1.25,
+            output_per_1m_usd: 10.0,
+        }
+    } else if lower.contains("gemini") && lower.contains("flash") {
+        ModelPricing {
+            input_per_1m_usd: 0.15,
+            cache_read_per_1m_usd: 0.0375,
+            output_per_1m_usd: 0.6,
+        }
+    } else if lower.contains("gemini") {
+        ModelPricing {
+            input_per_1m_usd: 1.25,
+            cache_read_per_1m_usd: 0.3125,
+            output_per_1m_usd: 10.0,
+        }
+    } else {
+        ModelPricing {
+            input_per_1m_usd: 2.0,
+            cache_read_per_1m_usd: 0.2,
+            output_per_1m_usd: 8.0,
+        }
+    }
 }
 
 /// Append-only local SQLite (WAL) store for Workspace -> Session -> Turn -> Step trajectories.
@@ -272,6 +385,132 @@ impl TrajectoryStore {
             other => TrajectoryError::Sqlite(other),
         })
     }
+
+    /// Aggregates local SQLite WAL trajectories over the trailing `days` window (`0` = all time)
+    /// to compute Prompt Caching hit rates, Ctrl+C stop-loss counts, and estimated USD savings.
+    pub fn get_savings_summary(
+        &self,
+        days: u32,
+        custom_pricing: &HashMap<String, ModelPricing>,
+    ) -> Result<SavingsSummary, TrajectoryError> {
+        let cutoff_ms: i64 = if days == 0 {
+            0
+        } else {
+            now_epoch_ms().saturating_sub(i64::from(days) * 86_400_000)
+        };
+
+        let conn = self.conn.lock().expect("trajectory mutex poisoned");
+        let mut stmt = conn.prepare(
+            "
+            SELECT
+                actual_model,
+                COUNT(*) AS reqs,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_cnt,
+                SUM(CASE WHEN status = 'aborted_by_client' THEN 1 ELSE 0 END) AS aborted_cnt,
+                SUM(CASE WHEN sticky_hit != 0 THEN 1 ELSE 0 END) AS sticky_cnt,
+                SUM(input_tokens) AS sum_in,
+                SUM(cache_read_tokens) AS sum_cache,
+                SUM(output_tokens) AS sum_out
+            FROM trajectory_steps
+            WHERE created_at_ms >= ?1
+            GROUP BY actual_model
+            ORDER BY reqs DESC, actual_model ASC
+            ",
+        )?;
+
+        let rows = stmt.query_map(params![cutoff_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?.max(0) as u64,
+                r.get::<_, i64>(2)?.max(0) as u64,
+                r.get::<_, i64>(3)?.max(0) as u64,
+                r.get::<_, i64>(4)?.max(0) as u64,
+                r.get::<_, i64>(5)?.max(0) as u64,
+                r.get::<_, i64>(6)?.max(0) as u64,
+                r.get::<_, i64>(7)?.max(0) as u64,
+            ))
+        })?;
+
+        let mut total_requests = 0u64;
+        let mut completed_requests = 0u64;
+        let mut aborted_by_client_count = 0u64;
+        let mut sticky_hit_count = 0u64;
+        let mut total_input_tokens = 0u64;
+        let mut total_cache_read_tokens = 0u64;
+        let mut total_output_tokens = 0u64;
+        let mut estimated_actual_cost_usd = 0.0f64;
+        let mut estimated_cache_savings_usd = 0.0f64;
+        let mut estimated_stop_loss_savings_usd = 0.0f64;
+        let mut by_model = Vec::new();
+
+        for row in rows {
+            let (model, reqs, comp, aborted, sticky, in_tok, cache_tok, out_tok) = row?;
+            total_requests += reqs;
+            completed_requests += comp;
+            aborted_by_client_count += aborted;
+            sticky_hit_count += sticky;
+            total_input_tokens += in_tok;
+            total_cache_read_tokens += cache_tok;
+            total_output_tokens += out_tok;
+
+            let price = resolve_model_pricing(&model, custom_pricing);
+            let actual_cost = (in_tok as f64 * price.input_per_1m_usd
+                + cache_tok as f64 * price.cache_read_per_1m_usd
+                + out_tok as f64 * price.output_per_1m_usd)
+                / 1_000_000.0;
+            let cache_savings = (cache_tok as f64
+                * (price.input_per_1m_usd - price.cache_read_per_1m_usd).max(0.0))
+                / 1_000_000.0;
+            // Conservative estimate: each mid-stream Ctrl+C abort avoids ~800 trailing output tokens
+            let stop_loss_savings = (aborted as f64 * 800.0 * price.output_per_1m_usd) / 1_000_000.0;
+
+            estimated_actual_cost_usd += actual_cost;
+            estimated_cache_savings_usd += cache_savings;
+            estimated_stop_loss_savings_usd += stop_loss_savings;
+
+            let denom = in_tok + cache_tok;
+            let hit_ratio = if denom == 0 {
+                0.0
+            } else {
+                cache_tok as f64 / denom as f64
+            };
+
+            by_model.push(ModelSavingsRow {
+                model,
+                requests: reqs,
+                input_tokens: in_tok,
+                cache_read_tokens: cache_tok,
+                output_tokens: out_tok,
+                cache_hit_ratio: hit_ratio,
+                aborted_count: aborted,
+                estimated_actual_cost_usd: actual_cost,
+                estimated_cache_savings_usd: cache_savings,
+            });
+        }
+
+        let total_in_denom = total_input_tokens + total_cache_read_tokens;
+        let avg_cache_hit_ratio = if total_in_denom == 0 {
+            0.0
+        } else {
+            total_cache_read_tokens as f64 / total_in_denom as f64
+        };
+
+        Ok(SavingsSummary {
+            window_days: days,
+            total_requests,
+            completed_requests,
+            aborted_by_client_count,
+            sticky_hit_count,
+            total_input_tokens,
+            total_cache_read_tokens,
+            total_output_tokens,
+            avg_cache_hit_ratio,
+            estimated_actual_cost_usd,
+            estimated_cache_savings_usd,
+            estimated_stop_loss_savings_usd,
+            by_model,
+        })
+    }
 }
 
 fn map_step_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TrajectoryStep> {
@@ -361,5 +600,50 @@ mod tests {
         let steps = store.get_session_steps("sess_demo").unwrap();
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[1].parent_step_id.as_deref(), Some("step_1"));
+    }
+
+    #[test]
+    fn savings_summary_aggregates_cache_hits_aborts_and_custom_pricing() {
+        let store = TrajectoryStore::open_in_memory().unwrap();
+        let now = now_epoch_ms();
+        let make = |id: &str, model: &str, in_t: u64, cache_t: u64, out_t: u64, status: &str| {
+            TrajectoryStep {
+                step_id: id.into(),
+                workspace: "loomgate".into(),
+                session_id: "s1".into(),
+                parent_step_id: None,
+                turn_index: 1,
+                protocol: "anthropic".into(),
+                channel_id: "anthropic-primary".into(),
+                requested_model: model.into(),
+                actual_model: model.into(),
+                route_mode: "lock".into(),
+                sticky_hit: cache_t > 0,
+                ttft_ms: 120,
+                input_tokens: in_t,
+                cache_read_tokens: cache_t,
+                output_tokens: out_t,
+                status: status.into(),
+                request_json: "{}".into(),
+                response_text: "ok".into(),
+                tool_calls_json: "[]".into(),
+                created_at_ms: now,
+            }
+        };
+        store
+            .append_step(&make("st1", "claude-sonnet-4-20250514", 100_000, 900_000, 10_000, "completed"))
+            .unwrap();
+        store
+            .append_step(&make("st2", "claude-sonnet-4-20250514", 50_000, 0, 200, "aborted_by_client"))
+            .unwrap();
+
+        let summary = store.get_savings_summary(30, &HashMap::new()).unwrap();
+        assert_eq!(summary.total_requests, 2);
+        assert_eq!(summary.aborted_by_client_count, 1);
+        assert_eq!(summary.total_cache_read_tokens, 900_000);
+        // 900k cached tokens on Sonnet saves 0.9 * ($3.00 - $0.30) = $2.43
+        assert!((summary.estimated_cache_savings_usd - 2.43).abs() < 1e-4);
+        assert!(summary.estimated_stop_loss_savings_usd > 0.0);
+        assert_eq!(summary.by_model.len(), 1);
     }
 }
