@@ -2,6 +2,23 @@
 
 All notable changes to **LoomGate** are documented in this file.
 
+## [1.0.0] - 2026-11-26
+
+### Highlights — General Availability Release
+**LoomGate v1.0.0** is the first stable, general-availability release of the Edge-Cloud Hybrid Microkernel AI Gateway — unifying native desktop ergonomics, one-command Docker team hosting, lossless 3-protocol translation, local offline resilience, and privacy-first trajectory observability.
+
+### Added
+- **Unified Dual-Runtime React Console (`apps/desktop/src/api/client.ts`)**:
+  - Single React/Vite codebase runs seamlessly as both a **Tauri v2 Desktop Studio** (native IPC `invoke`) and a **Browser Web Console** (same-origin HTTP REST API).
+  - Automatic ephemeral `sessionStorage` Admin Password unlock bar (`x-admin-password`) when `admin_password` is enabled (never persisted to `localStorage` or bundled source); passwordless on localhost when unset.
+- **Built-in Static Web Hosting & Multi-Stage Docker Deployment**:
+  - `gateway-daemon` supports `--web-dist <dir>` / `LOOMGATE_WEB_DIST` with path-traversal protection and strict API precedence (`/v1/*`, `/v1beta/*`, `/api/*`, `/__admin/*` never masked by SPA HTML), plus REST parity endpoints (`/api/status`, `/api/route-mode`, `/api/clients/:id/takeover`, `/api/clients/:id/restore`).
+  - Added multi-stage root `Dockerfile`, `.dockerignore`, and `deploy/docker-compose.yml` (`docker compose -f deploy/docker-compose.yml up -d` serves both the 3-protocol AI Gateway and Web Control Studio at `http://localhost:8787`).
+- **Open-Source Bilingual Storefront & Ecosystem Governance**:
+  - Flagship English `README.md` and Chinese `README_ZH.md` with Mermaid architecture diagram, proxy comparison matrix, and 30-second quickstart (Desktop / Docker / npm CLI).
+  - Added `docs/EXTENSIONS.md` (custom Client Profile TOML/JSON, custom Onion `Middleware` Trait, custom `ProtocolCodec` Trait), `CONTRIBUTING.md`, and `SECURITY.md`.
+- Expanded end-to-end conformance suite to **18/18** and Rust workspace unit tests to **26/26** across all 4 crates.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added

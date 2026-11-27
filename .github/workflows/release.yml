@@ -65,8 +65,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: apps/desktop
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.5.0' }}
-          releaseName: "LoomGate ${{ github.ref_type == 'tag' && github.ref_name || 'v0.5.0' }}"
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}
+          releaseName: "LoomGate ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}"
           releaseBody: |
             ## LoomGate Desktop Installers
 
