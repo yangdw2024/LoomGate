@@ -10,8 +10,8 @@ use gateway_core::{
     discover_local_providers, AuthSettings, ChannelConfig, ChannelSnapshot, ChannelTestResult,
     CliIntegrationStatus, CliTakeoverManager, CliTool, ClientProfileStatus, CloudSessionStatus,
     DiscoveredLocalProvider, ForkDiffExport, ForkDiffResult, GatewayConfig, GatewayEngine,
-    GatewayError, GatewayResponse, RouteMode, SavingsSummary, SessionSummary, TrajectoryStep,
-    UpstreamProtocol,
+    GatewayError, GatewayResponse, RouteMode, SavingsSummary, SessionSummary, TrafficInspectEntry,
+    TrajectoryStep, UpstreamProtocol,
 };
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -314,6 +314,28 @@ fn import_local_provider(
 }
 
 #[tauri::command]
+fn list_traffic_inspector(
+    state: TauriState<'_, DesktopState>,
+    limit: Option<usize>,
+) -> Vec<TrafficInspectEntry> {
+    state.engine.list_traffic(limit.unwrap_or(50))
+}
+
+#[tauri::command]
+fn get_traffic_inspector_entry(
+    state: TauriState<'_, DesktopState>,
+    request_id: String,
+) -> Option<TrafficInspectEntry> {
+    state.engine.get_traffic(&request_id)
+}
+
+#[tauri::command]
+fn clear_traffic_inspector(state: TauriState<'_, DesktopState>) -> bool {
+    state.engine.clear_traffic();
+    true
+}
+
+#[tauri::command]
 fn get_savings_summary(
     state: TauriState<'_, DesktopState>,
     days: u32,
@@ -429,6 +451,7 @@ async fn run_embedded_proxy(
         .route("/v1/messages", post(proxy_anthropic))
         .route("/v1/messages/count_tokens", post(proxy_anthropic_count_tokens))
         .route("/v1/chat/completions", post(proxy_openai))
+        .route("/v1/responses", post(proxy_openai_responses))
         .route("/v1beta/models/:model_action", post(proxy_gemini))
         .with_state(engine);
 
@@ -504,6 +527,14 @@ async fn proxy_openai(
     Json(payload): Json<Value>,
 ) -> Response {
     dispatch(engine, UpstreamProtocol::OpenAi, headers, payload).await
+}
+
+async fn proxy_openai_responses(
+    State(engine): State<Arc<GatewayEngine>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    dispatch(engine, UpstreamProtocol::OpenAiResponses, headers, payload).await
 }
 
 async fn proxy_gemini(
@@ -791,6 +822,9 @@ pub fn run() {
             scan_local_providers,
             import_local_provider,
             get_savings_summary,
+            list_traffic_inspector,
+            get_traffic_inspector_entry,
+            clear_traffic_inspector,
             list_client_profiles,
             takeover_client_profile,
             restore_client_profile,

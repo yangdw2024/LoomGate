@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { LoomGateClient } from "../dist/index.js";
+
+const execFileAsync = promisify(execFile);
 
 test("LoomGateClient interacts with health, channels, 3 protocols, fork & cloud endpoints", async () => {
   const seen = [];
@@ -26,6 +31,49 @@ test("LoomGateClient interacts with health, channels, 3 protocols, fork & cloud 
       } else if (req.url === "/v1beta/models/gemini-2.5-pro:generateContent") {
         res.setHeader("X-Gateway-Actual-Model", "gemini-2.5-pro");
         res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }));
+      } else if (req.url === "/v1/responses" && req.method === "POST") {
+        res.setHeader("X-Gateway-Actual-Model", "gpt-5-codex");
+        res.end(
+          JSON.stringify({
+            id: "resp_test_1",
+            object: "response",
+            status: "completed",
+            model: "gpt-5-codex",
+            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "responses ok" }] }],
+          })
+        );
+      } else if (req.url.startsWith("/api/inspector") && req.method === "GET") {
+        res.end(
+          JSON.stringify({
+            entries: [
+              {
+                request_id: "req_insp_1",
+                ts_ms: 1700000000000,
+                downstream_protocol: "openai_responses",
+                upstream_protocol: "openai_responses",
+                requested_model: "gpt-5-codex",
+                actual_model: "gpt-5-codex",
+                channel_id: "openai-responses-primary",
+                route_mode: "lock",
+                sticky_hit: false,
+                stream: false,
+                ttft_ms: 12,
+                status: "completed",
+                input_tokens: 100,
+                cache_read_tokens: 0,
+                output_tokens: 20,
+                guardrail_redactions: 1,
+                blocked_reason: null,
+                inbound_preview: "[REDACTED_SECRET]",
+                canonical_ir_summary: "{}",
+                upstream_preview: "responses ok",
+                sse_events: [],
+              },
+            ],
+          })
+        );
+      } else if (req.url === "/api/inspector" && req.method === "DELETE") {
+        res.end(JSON.stringify({ ok: true }));
       } else {
         res.statusCode = 404;
         res.end(JSON.stringify({ error: "not found" }));
@@ -65,6 +113,34 @@ test("LoomGateClient interacts with health, channels, 3 protocols, fork & cloud 
     }, { sessionId: "s-1" });
     assert.equal(gem.status, 200);
     assert.equal(gem.headers["x-gateway-actual-model"], "gemini-2.5-pro");
+
+    const resp = await client.responses(
+      { model: "gpt-5-codex", input: "hello responses" },
+      { sessionId: "s-resp-1" }
+    );
+    assert.equal(resp.status, 200);
+    assert.equal(resp.headers["x-gateway-actual-model"], "gpt-5-codex");
+    assert.equal(resp.data.object, "response");
+
+    const entries = await client.inspector(10);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].request_id, "req_insp_1");
+    assert.equal(entries[0].inbound_preview, "[REDACTED_SECRET]");
+    assert.ok(seen.some((s) => s.method === "GET" && s.url === "/api/inspector?limit=10"));
+
+    const cleared = await client.clearInspector();
+    assert.equal(cleared.ok, true);
+    assert.ok(seen.some((s) => s.method === "DELETE" && s.url === "/api/inspector"));
+
+    const cliPath = fileURLToPath(new URL("../bin/loomgate.mjs", import.meta.url));
+    const { stdout } = await execFileAsync(process.execPath, [cliPath, "inspector", "5"], {
+      env: { ...process.env, LOOMGATE_URL: `http://127.0.0.1:${port}`, LOOMGATE_TOKEN: "lg_test_token" },
+    });
+    const cliEntries = JSON.parse(stdout);
+    assert.equal(cliEntries.length, 1);
+    assert.equal(cliEntries[0].request_id, "req_insp_1");
+    assert.ok(seen.some((s) => s.method === "GET" && s.url === "/api/inspector?limit=5"));
+
     assert.equal(seen[0].auth, "Bearer lg_test_token");
   } finally {
     server.close();

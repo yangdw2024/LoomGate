@@ -2,7 +2,7 @@
 import { LoomGateClient } from "../dist/index.js";
 
 function usage() {
-  console.log(`LoomGate CLI v1.0.0 — Edge-Cloud Hybrid Microkernel AI Gateway
+  console.log(`LoomGate CLI v1.1.0 — Edge-Cloud Hybrid Microkernel AI Gateway
 
 Usage:
   loomgate status                                Show health, channels, middleware & cloud status
@@ -11,6 +11,7 @@ Usage:
   loomgate fork <step_id> <target_model>         Fork & diff a historical step on another model
   loomgate diff-export <orig_id> <fork_id>       Export Guardrail-redacted Markdown Fork & Diff report
   loomgate savings [days]                        Show Prompt Caching & Ctrl+C stop-loss savings (default: 30d)
+  loomgate inspector [limit]                     List recent Live Traffic Inspector entries (default: 50)
   loomgate local scan [ports_csv]                Scan localhost for Ollama / LM Studio / vLLM runtimes
   loomgate mcp list                              List aggregated MCP tools & middleware layers
   loomgate mcp call <tool> [json_args]           Invoke a bridged MCP tool
@@ -57,6 +58,9 @@ async function main() {
     } else if (cmd === "savings") {
       const days = sub !== undefined ? Number(sub) : 30;
       console.log(JSON.stringify(await client.savings(Number.isFinite(days) ? days : 30), null, 2));
+    } else if (cmd === "inspector") {
+      const limit = sub !== undefined ? Number(sub) : 50;
+      console.log(JSON.stringify(await client.inspector(Number.isFinite(limit) ? limit : 50), null, 2));
     } else if (cmd === "local" && sub === "scan") {
       const ports = a1
         ? a1

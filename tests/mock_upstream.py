@@ -192,6 +192,36 @@ def make_handler(state: ChannelState):
                             },
                         },
                     )
+                elif self.path.startswith("/v1/responses"):
+                    self._send_json(
+                        200,
+                        {
+                            "id": f"resp_{state.channel_id}_{state.total_requests}",
+                            "object": "response",
+                            "status": "completed",
+                            "model": model,
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": f"Responses reply from {state.channel_id} ({model})",
+                                        }
+                                    ],
+                                }
+                            ],
+                            "usage": {
+                                "input_tokens": 1000,
+                                "output_tokens": 30,
+                                "total_tokens": 1030,
+                                "input_tokens_details": {
+                                    "cached_tokens": 900 if cache_hit else 0
+                                },
+                            },
+                        },
+                    )
                 else:
                     self._send_json(
                         200,
@@ -320,8 +350,86 @@ def make_handler(state: ChannelState):
                             },
                         },
                     )
-                else:
+                elif self.path.startswith("/v1/responses"):
+                    resp_id = f"resp_{state.channel_id}_{state.total_requests}"
+                    self._write_sse(
+                        "response.created",
+                        {
+                            "type": "response.created",
+                            "response": {
+                                "id": resp_id,
+                                "object": "response",
+                                "status": "in_progress",
+                                "model": model,
+                                "output": [],
+                            },
+                        },
+                    )
                     for i in range(chunks):
+                        time.sleep(delay)
+                        self._write_sse(
+                            "response.output_text.delta",
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": f"Responses中文-{i} ",
+                            },
+                        )
+                    self._write_sse(
+                        "response.completed",
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": resp_id,
+                                "object": "response",
+                                "status": "completed",
+                                "model": model,
+                                "output": [],
+                                "usage": {
+                                    "input_tokens": 1000,
+                                    "output_tokens": chunks * 4,
+                                    "total_tokens": 1000 + chunks * 4,
+                                    "input_tokens_details": {
+                                        "cached_tokens": 900 if cache_hit else 0
+                                    },
+                                },
+                            },
+                        },
+                    )
+                else:
+                    trigger_blocked = bool(payload.get("mock_blocked_tool_stream")) or (
+                        "TRIGGER_BLOCKED_TOOL_STREAM"
+                        in json.dumps(payload.get("messages", []), ensure_ascii=False)
+                    )
+                    if trigger_blocked:
+                        self._write_sse(
+                            None,
+                            {
+                                "id": f"chatcmpl_{state.channel_id}",
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": 0,
+                                                    "id": "call_blocked_1",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": "drop_database",
+                                                        "arguments": '{"table":"users"}',
+                                                    },
+                                                }
+                                            ]
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            },
+                        )
                         time.sleep(delay)
                         self._write_sse(
                             None,
@@ -332,26 +440,46 @@ def make_handler(state: ChannelState):
                                 "choices": [
                                     {
                                         "index": 0,
-                                        "delta": {"content": f"跨协议中文-{i} "},
-                                        "finish_reason": None,
+                                        "delta": {"content": "should not reach client"},
+                                        "finish_reason": "stop",
                                     }
                                 ],
                             },
                         )
-                    self._write_sse(
-                        None,
-                        {
-                            "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                            "usage": {
-                                "prompt_tokens": 1000,
-                                "completion_tokens": chunks * 4,
-                                "prompt_tokens_details": {"cached_tokens": 900 if cache_hit else 0},
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    else:
+                        for i in range(chunks):
+                            time.sleep(delay)
+                            self._write_sse(
+                                None,
+                                {
+                                    "id": f"chatcmpl_{state.channel_id}",
+                                    "object": "chat.completion.chunk",
+                                    "model": model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": f"跨协议中文-{i} "},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                },
+                            )
+                        self._write_sse(
+                            None,
+                            {
+                                "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                "usage": {
+                                    "prompt_tokens": 1000,
+                                    "completion_tokens": chunks * 4,
+                                    "prompt_tokens_details": {"cached_tokens": 900 if cache_hit else 0},
+                                },
                             },
-                        },
-                    )
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
+                        )
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
 
                 with state.lock:
                     state.completed_streams += 1

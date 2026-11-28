@@ -213,6 +213,9 @@ npx loomgate savings 30
 ### P2C Channel Pool, Explicit Lock / Stage-Aware & Local Offline Fallback
 <img src="docs/assets/loomgate-dashboard-channels.png" alt="LoomGate Studio — P2C Upstream Channel Pool, Lock Mode, Local Ollama Offline Fallback, and Split Local Security" width="960" />
 
+### Live Traffic Inspector ("Charles for AI Agents" — Canonical IR, Redacted Wire & SSE Timeline)
+<img src="docs/assets/loomgate-live-inspector.png" alt="LoomGate Studio — Live Traffic Inspector showing Canonical IR, Redacted Inbound/Upstream Wire, and Mid-Stream Guardrail Block" width="960" />
+
 ### Local Prompt Caching Savings & `Ctrl+C` Stop-Loss Telemetry
 <img src="docs/assets/loomgate-savings-telemetry.png" alt="LoomGate Studio — Local Prompt Caching Savings, KV Hit Rate, and Ctrl+C Stop-Loss Dashboard" width="960" />
 

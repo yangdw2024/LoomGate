@@ -275,6 +275,86 @@ fn builtin_profiles() -> Vec<ClientProfile> {
             }),
         },
         ClientProfile {
+            id: "deepseek_harness".into(),
+            display_name: "DeepSeek Harness".into(),
+            category: "AI Coding Agent".into(),
+            kind: IntegrationKind::SetupWizard,
+            description: "Route DeepSeek Harness sessions through LoomGate with Anthropic /v1/messages and OpenAI /v1/responses support.".into(),
+            custom: false,
+            atomic: None,
+            wizard: Some(SetupWizardSpec {
+                protocol: "anthropic / openai / responses".into(),
+                endpoint_template: "{{GATEWAY_URL}}/v1".into(),
+                env_snippet_template: "export ANTHROPIC_BASE_URL=\"{{GATEWAY_URL}}\"\nexport ANTHROPIC_API_KEY=\"{{API_KEY}}\"\nexport OPENAI_BASE_URL=\"{{GATEWAY_URL}}/v1\"\nexport OPENAI_API_KEY=\"{{API_KEY}}\"".into(),
+                config_snippet_template: "{\n  \"provider\": \"loomgate\",\n  \"apiKey\": \"{{API_KEY}}\",\n  \"baseUrl\": \"{{GATEWAY_URL}}/v1\",\n  \"endpoints\": {\n    \"anthropicMessages\": \"{{GATEWAY_URL}}/v1/messages\",\n    \"openaiResponses\": \"{{GATEWAY_URL}}/v1/responses\"\n  }\n}".into(),
+                instructions: vec![
+                    "Open DeepSeek Harness Settings -> Providers -> Add Custom Provider (LoomGate).".into(),
+                    "Set Base URL to {{GATEWAY_URL}}/v1 (supports /v1/responses and /v1/chat/completions) or {{GATEWAY_URL}} for Anthropic /v1/messages.".into(),
+                    "Set API Key to {{API_KEY}} to enable sticky prefix-cache routing and local trajectory capture.".into(),
+                ],
+            }),
+        },
+        ClientProfile {
+            id: "opencode".into(),
+            display_name: "OpenCode".into(),
+            category: "CLI Agent".into(),
+            kind: IntegrationKind::SetupWizard,
+            description: "Connect OpenCode CLI via ~/.config/opencode/opencode.json or environment variables.".into(),
+            custom: false,
+            atomic: None,
+            wizard: Some(SetupWizardSpec {
+                protocol: "openai / anthropic".into(),
+                endpoint_template: "{{GATEWAY_URL}}/v1".into(),
+                env_snippet_template: "export OPENAI_BASE_URL=\"{{GATEWAY_URL}}/v1\"\nexport OPENAI_API_KEY=\"{{API_KEY}}\"\nexport ANTHROPIC_BASE_URL=\"{{GATEWAY_URL}}\"\nexport ANTHROPIC_API_KEY=\"{{API_KEY}}\"".into(),
+                config_snippet_template: "{\n  \"provider\": {\n    \"loomgate\": {\n      \"npm\": \"@ai-sdk/openai-compatible\",\n      \"name\": \"LoomGate\",\n      \"options\": {\n        \"baseURL\": \"{{GATEWAY_URL}}/v1\",\n        \"apiKey\": \"{{API_KEY}}\"\n      }\n    }\n  }\n}".into(),
+                instructions: vec![
+                    "Create or edit ~/.config/opencode/opencode.json and add the LoomGate provider block.".into(),
+                    "Set options.baseURL to {{GATEWAY_URL}}/v1 and options.apiKey to {{API_KEY}} (or export the env vars).".into(),
+                    "Select a model under the loomgate provider in OpenCode to route through LoomGate.".into(),
+                ],
+            }),
+        },
+        ClientProfile {
+            id: "claude_desktop".into(),
+            display_name: "Claude Desktop".into(),
+            category: "Desktop App".into(),
+            kind: IntegrationKind::SetupWizard,
+            description: "Route Claude Desktop Anthropic API integrations and MCP server workflows through LoomGate.".into(),
+            custom: false,
+            atomic: None,
+            wizard: Some(SetupWizardSpec {
+                protocol: "anthropic".into(),
+                endpoint_template: "{{GATEWAY_URL}}".into(),
+                env_snippet_template: "export ANTHROPIC_BASE_URL=\"{{GATEWAY_URL}}\"\nexport ANTHROPIC_API_KEY=\"{{API_KEY}}\"".into(),
+                config_snippet_template: "{\n  \"anthropicBaseUrl\": \"{{GATEWAY_URL}}\",\n  \"anthropicApiKey\": \"{{API_KEY}}\",\n  \"mcpServers\": {\n    \"loomgate-env\": {\n      \"env\": {\n        \"ANTHROPIC_BASE_URL\": \"{{GATEWAY_URL}}\",\n        \"ANTHROPIC_API_KEY\": \"{{API_KEY}}\"\n      }\n    }\n  }\n}".into(),
+                instructions: vec![
+                    "Open Claude Desktop Settings -> Developer -> Edit Config (claude_desktop_config.json).".into(),
+                    "Point Anthropic API or MCP server env blocks to ANTHROPIC_BASE_URL={{GATEWAY_URL}} with ANTHROPIC_API_KEY={{API_KEY}}.".into(),
+                    "Restart Claude Desktop to route Anthropic requests through LoomGate with cache_control preserved.".into(),
+                ],
+            }),
+        },
+        ClientProfile {
+            id: "aider".into(),
+            display_name: "Aider".into(),
+            category: "CLI Agent".into(),
+            kind: IntegrationKind::SetupWizard,
+            description: "Configure Aider CLI via ~/.aider.conf.yml or OPENAI_API_BASE / ANTHROPIC_BASE_URL.".into(),
+            custom: false,
+            atomic: None,
+            wizard: Some(SetupWizardSpec {
+                protocol: "openai / anthropic".into(),
+                endpoint_template: "{{GATEWAY_URL}}/v1".into(),
+                env_snippet_template: "export OPENAI_API_BASE=\"{{GATEWAY_URL}}/v1\"\nexport OPENAI_API_KEY=\"{{API_KEY}}\"\nexport ANTHROPIC_BASE_URL=\"{{GATEWAY_URL}}\"\nexport ANTHROPIC_API_KEY=\"{{API_KEY}}\"".into(),
+                config_snippet_template: "# ~/.aider.conf.yml\nopenai-api-base: {{GATEWAY_URL}}/v1\nopenai-api-key: {{API_KEY}}\nanthropic-api-key: {{API_KEY}}\n# Set ANTHROPIC_BASE_URL={{GATEWAY_URL}} in your shell when using Claude models".into(),
+                instructions: vec![
+                    "Add openai-api-base: {{GATEWAY_URL}}/v1 and api keys to ~/.aider.conf.yml.".into(),
+                    "Or export OPENAI_API_BASE={{GATEWAY_URL}}/v1 and ANTHROPIC_BASE_URL={{GATEWAY_URL}} with key {{API_KEY}}.".into(),
+                    "Launch aider with --model openai/<model> or --model anthropic/<model> to use LoomGate sticky routing.".into(),
+                ],
+            }),
+        },
+        ClientProfile {
             id: "generic_sdk".into(),
             display_name: "Generic OpenAI / Anthropic / Gemini SDK".into(),
             category: "SDK / Script".into(),
@@ -743,8 +823,8 @@ format = "json"
 
         let mgr = CliTakeoverManager::with_home_dir(tmp_home.clone(), "http://127.0.0.1:8787");
         let list = mgr.list_profiles(Some("lg_secret_123"));
-        // 8 built-ins (3 atomic + 5 wizards) + 1 custom = 9
-        assert_eq!(list.len(), 9);
+        // 12 built-ins (3 atomic + 9 wizards) + 1 custom = 13
+        assert_eq!(list.len(), 13);
         let cursor = list.iter().find(|p| p.id == "cursor").unwrap();
         assert_eq!(cursor.kind, IntegrationKind::SetupWizard);
         assert!(cursor
@@ -752,6 +832,31 @@ format = "json"
             .as_deref()
             .unwrap()
             .contains("lg_secret_123"));
+
+        for (id, expected_endpoint) in [
+            ("deepseek_harness", "http://127.0.0.1:8787/v1"),
+            ("opencode", "http://127.0.0.1:8787/v1"),
+            ("claude_desktop", "http://127.0.0.1:8787"),
+            ("aider", "http://127.0.0.1:8787/v1"),
+        ] {
+            let prof = list
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("missing built-in profile {id}"));
+            assert_eq!(prof.kind, IntegrationKind::SetupWizard);
+            assert!(!prof.custom);
+            assert_eq!(prof.wizard_endpoint.as_deref(), Some(expected_endpoint));
+            let env_snippet = prof.env_snippet.as_deref().unwrap();
+            let config_snippet = prof.config_snippet.as_deref().unwrap();
+            assert!(env_snippet.contains("http://127.0.0.1:8787"));
+            assert!(env_snippet.contains("lg_secret_123"));
+            assert!(!env_snippet.contains("{{GATEWAY_URL}}"));
+            assert!(!env_snippet.contains("{{API_KEY}}"));
+            assert!(config_snippet.contains("http://127.0.0.1:8787"));
+            assert!(config_snippet.contains("lg_secret_123"));
+            assert!(!config_snippet.contains("{{GATEWAY_URL}}"));
+            assert!(!config_snippet.contains("{{API_KEY}}"));
+        }
 
         let custom = mgr
             .takeover_by_id("aider_custom", Some("lg_secret_123"))

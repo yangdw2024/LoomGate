@@ -2,6 +2,25 @@
 
 All notable changes to **LoomGate** are documented in this file.
 
+## [1.1.0] - 2026-11-28
+
+### Added
+- **Native OpenAI Responses API (`POST /v1/responses`)**:
+  - Added full lossless bidirectional `OpenAiResponsesCodec` (`crates/gateway-core/src/codec/openai_responses.rs`) supporting `instructions`, multi-item `input` (`message`, `function_call`, `function_call_output`, `reasoning`), `strict` tool schemas, `reasoning.effort`, cached token usage (`input_tokens_details.cached_tokens`), and native Responses SSE events (`response.created`, `response.output_text.delta`, `response.reasoning_summary_text.delta`, `response.function_call_arguments.delta`, `response.completed`).
+  - Seamless cross-protocol translation between `/v1/responses`, Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, and Gemini native endpoints.
+- **Live Traffic Inspector ("Charles for AI Agents")**:
+  - Added bounded 200-entry `LiveTrafficInspector` ring buffer (`crates/gateway-core/src/inspector.rs`) with automatic Guardrail secret/PII redaction and UTF-8 safe preview truncation.
+  - Exposed `GET/DELETE /api/inspector`, `GET /api/inspector/:request_id`, Tauri IPC commands, `loomgate inspector` CLI / SDK methods, and a brand-new **Live Inspector** split-pane UI tab displaying Canonical IR summaries, redacted Inbound/Upstream wire payloads, blocked-reason alerts, and ordered SSE event timelines.
+- **Streaming Guardrail Tool Interception**:
+  - Added `StreamGuardrailChecker` (`crates/gateway-core/src/middleware/guardrail.rs`) inside the live SSE pump to intercept blocked tool names and split dangerous argument chunks mid-stream, immediately canceling upstream TCP and recording `guardrail_blocked`.
+  - Fixed UTF-8 multi-byte boundary safety in `redact_bearer_tokens`.
+- **`stdio` MCP Subprocess Bridge**:
+  - Extended `McpBridgeMiddleware` (`crates/gateway-core/src/middleware/mcp_bridge.rs`) with backward-compatible `McpTransport::Stdio` JSON-RPC 2.0 discovery (`tools/list`) and execution (`tools/call`) over `tokio::process::Command`.
+- **12 Built-in Agent Profiles & Modular React Architecture**:
+  - Added **DeepSeek Harness**, **OpenCode**, **Claude Desktop**, and **Aider** to `crates/gateway-core/src/cli_takeover.rs` (12 built-in profiles total) and documented `docs/ROADMAP.md`.
+  - Refactored monolithic `apps/desktop/src/App.tsx` (1,804 → 308 lines) into clean page modules under `apps/desktop/src/pages/` and `apps/desktop/src/utils/diff.ts`.
+- Expanded Rust workspace unit tests to **36/36** and end-to-end conformance suite to **22/22**.
+
 ## [1.0.0] - 2026-11-26
 
 ### Highlights — General Availability Release

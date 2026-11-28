@@ -1,6 +1,6 @@
 {
   "name": "loomgate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Official TypeScript SDK & CLI for LoomGate — Edge-Cloud Hybrid Microkernel AI Gateway (Anthropic / OpenAI / Gemini lossless IR, Trajectory Fork & Diff, Onion Middleware, MCP Bridge, Cloud Control Plane).",
   "type": "module",
   "main": "./dist/index.js",

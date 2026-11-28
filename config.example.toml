@@ -69,6 +69,14 @@ weight = 100
 models = ["gpt-4o", "gpt-4o-mini", "o3-mini"]
 
 [[channels]]
+id = "openai-responses-primary"
+protocol = "openai_responses"
+base_url = "http://127.0.0.1:18083"
+api_key = "sk-openai-mock-responses"
+weight = 100
+models = ["gpt-5-codex", "o4-mini"]
+
+[[channels]]
 id = "gemini-primary"
 protocol = "gemini"
 base_url = "http://127.0.0.1:18084"

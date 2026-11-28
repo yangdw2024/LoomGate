@@ -159,6 +159,19 @@ export class LoomGateClient {
       opts
     );
   }
+
+  responses(payload, opts = {}) {
+    return this._request("POST", "/v1/responses", payload, opts);
+  }
+
+  async inspector(limit = 50) {
+    const res = await this._mustOk("GET", `/api/inspector?limit=${encodeURIComponent(String(limit))}`);
+    return res.entries || [];
+  }
+
+  clearInspector() {
+    return this._mustOk("DELETE", "/api/inspector");
+  }
 }
 
 export default LoomGateClient;

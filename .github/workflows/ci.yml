@@ -56,7 +56,7 @@ jobs:
       - name: Build daemon & cloud control plane for conformance suite
         run: cargo build -p gateway-daemon -p cloud-control-plane
 
-      - name: Run 18/18 End-to-End Conformance Suite
+      - name: Run 22/22 End-to-End Conformance Suite
         run: |
           python3 - <<'PY'
           import os, subprocess, sys, time, urllib.request

@@ -138,6 +138,30 @@ export interface ForkDiffExport {
   markdown: string;
 }
 
+export interface TrafficInspectEntry {
+  request_id: string;
+  ts_ms: number;
+  downstream_protocol: string;
+  upstream_protocol: string;
+  requested_model: string;
+  actual_model: string;
+  channel_id: string;
+  route_mode: string;
+  sticky_hit: boolean;
+  stream: boolean;
+  ttft_ms: number;
+  status: string;
+  input_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  guardrail_redactions: number;
+  blocked_reason: string | null;
+  inbound_preview: string;
+  canonical_ir_summary: string;
+  upstream_preview: string;
+  sse_events: string[];
+}
+
 export interface GatewayCallResult<T = unknown> {
   status: number;
   headers: Record<string, string>;
@@ -185,4 +209,10 @@ export class LoomGateClient {
   chatCompletions<T = Record<string, unknown>>(payload: Record<string, unknown>, opts?: RequestMetaOptions): Promise<GatewayCallResult<T>>;
   /** Gemini Native API (/v1beta/models/<model>:generateContent) routed through LoomGate lossless Canonical IR. */
   generateContent<T = Record<string, unknown>>(model: string, payload: Record<string, unknown>, opts?: RequestMetaOptions): Promise<GatewayCallResult<T>>;
+  /** OpenAI Responses API (/v1/responses) routed through LoomGate lossless Canonical IR. */
+  responses<T = Record<string, unknown>>(payload: Record<string, unknown>, opts?: RequestMetaOptions): Promise<GatewayCallResult<T>>;
+  /** Query recent sanitized entries from the Live Traffic Inspector ring buffer. */
+  inspector(limit?: number): Promise<TrafficInspectEntry[]>;
+  /** Clear the Live Traffic Inspector ring buffer. */
+  clearInspector(): Promise<{ ok: boolean }>;
 }

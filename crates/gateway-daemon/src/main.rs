@@ -88,6 +88,16 @@ struct SavingsQuery {
     days: u32,
 }
 
+#[derive(Deserialize)]
+struct InspectorQuery {
+    #[serde(default = "default_inspector_limit")]
+    limit: usize,
+}
+
+fn default_inspector_limit() -> usize {
+    50
+}
+
 fn default_savings_days() -> u32 {
     30
 }
@@ -232,6 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/local/discover", get(local_discover))
         .route("/api/local/import", post(local_import))
         .route("/api/analytics/savings", get(analytics_savings))
+        .route("/api/inspector", get(list_inspector).delete(clear_inspector))
+        .route("/api/inspector/:request_id", get(get_inspector_entry))
         .route("/api/clients", get(list_clients))
         .route("/api/clients/:id/takeover", post(takeover_client))
         .route("/api/clients/:id/restore", post(restore_client))
@@ -247,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/messages", post(handle_anthropic))
         .route("/v1/messages/count_tokens", post(handle_anthropic_count_tokens))
         .route("/v1/chat/completions", post(handle_openai))
+        .route("/v1/responses", post(handle_openai_responses))
         .route("/v1beta/models/:model_action", post(handle_gemini))
         .merge(admin_routes);
 
@@ -260,7 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind_addr = %bind_addr,
         db = %db_path,
         web_dist = ?web_dist,
-        "LoomGate local daemon listening (v1.0.0)"
+        "LoomGate local daemon listening (v1.1.0)"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -271,7 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "kernel": "gateway-core",
         "bind_addr": state.bind_addr,
         "route_mode": match state.engine.active_route_mode() {
@@ -406,6 +419,32 @@ async fn local_import(
         )
             .into_response(),
     }
+}
+
+async fn list_inspector(
+    State(state): State<AppState>,
+    Query(q): Query<InspectorQuery>,
+) -> impl IntoResponse {
+    Json(json!({ "entries": state.engine.list_traffic(q.limit) }))
+}
+
+async fn get_inspector_entry(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> impl IntoResponse {
+    match state.engine.get_traffic(&request_id) {
+        Some(entry) => Json(entry).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("traffic entry '{}' not found", request_id) })),
+        )
+            .into_response(),
+    }
+}
+
+async fn clear_inspector(State(state): State<AppState>) -> impl IntoResponse {
+    state.engine.clear_traffic();
+    Json(json!({ "ok": true }))
 }
 
 async fn analytics_savings(
@@ -647,6 +686,14 @@ async fn handle_openai(
     Json(payload): Json<Value>,
 ) -> Response {
     dispatch(state, UpstreamProtocol::OpenAi, headers, payload).await
+}
+
+async fn handle_openai_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    dispatch(state, UpstreamProtocol::OpenAiResponses, headers, payload).await
 }
 
 async fn handle_gemini(

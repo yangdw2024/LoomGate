@@ -932,6 +932,202 @@ def test_18_web_console_static_hosting_and_browser_http_api():
         )
 
 
+def _extract_responses_output_text(body: dict) -> str:
+    texts = []
+    for item in body.get("output", []):
+        if item.get("type") == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text" and part.get("text"):
+                    texts.append(part["text"])
+    return "".join(texts)
+
+
+def test_19_openai_responses_api_native_and_cross_protocol():
+    reset_all()
+
+    # 19a. Native POST /v1/responses targeting gpt-5-codex (non-streaming)
+    st_a, _, body_a = http_json(
+        "POST",
+        f"{GATEWAY}/v1/responses",
+        {
+            "model": "gpt-5-codex",
+            "stream": False,
+            "input": "Explain Rust ownership briefly",
+        },
+    )
+    assert st_a == 200, f"19a native responses failed: {st_a} {body_a}"
+    assert body_a.get("object") == "response", f"expected object=response: {body_a}"
+    assert body_a.get("status") == "completed", f"expected status=completed: {body_a}"
+    text_a = _extract_responses_output_text(body_a)
+    assert "Responses reply from openai-primary" in text_a, f"unexpected 19a output_text: {body_a}"
+
+    # 19b. Native POST /v1/responses streaming targeting gpt-5-codex
+    req_b = urllib.request.Request(
+        f"{GATEWAY}/v1/responses",
+        data=json.dumps(
+            {
+                "model": "gpt-5-codex",
+                "stream": True,
+                "input": "Stream CJK responses chunks",
+            },
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        method="POST",
+    )
+    req_b.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req_b, timeout=15) as resp_b:
+        assert resp_b.status == 200, f"19b stream status={resp_b.status}"
+        raw_sse = resp_b.read().decode("utf-8")
+
+    assert "event: response.created" in raw_sse, f"missing response.created in SSE: {raw_sse}"
+    assert "event: response.output_text.delta" in raw_sse, f"missing output_text.delta in SSE: {raw_sse}"
+    assert "event: response.completed" in raw_sse, f"missing response.completed in SSE: {raw_sse}"
+    for i in range(3):
+        assert f"Responses中文-{i}" in raw_sse, f"CJK chunk {i} corrupted in SSE: {raw_sse}"
+
+    # 19c. Cross-protocol POST /v1/responses targeting claude-sonnet-4-20250514
+    st_c, _, body_c = http_json(
+        "POST",
+        f"{GATEWAY}/v1/responses",
+        {
+            "model": "claude-sonnet-4-20250514",
+            "stream": False,
+            "input": "Translate from Anthropic upstream to Responses JSON",
+        },
+    )
+    assert st_c == 200, f"19c cross-protocol responses failed: {st_c} {body_c}"
+    assert body_c.get("object") == "response", f"expected object=response: {body_c}"
+    assert body_c.get("status") == "completed", f"expected status=completed: {body_c}"
+    text_c = _extract_responses_output_text(body_c)
+    assert "Anthropic reply from anthropic-" in text_c, f"unexpected 19c translated output_text: {body_c}"
+
+    return "native non-stream + CJK SSE stream + Anthropic cross-protocol /v1/responses verified"
+
+
+def test_20_streaming_guardrail_blocks_high_risk_tool_midstream():
+    reset_all()
+    req = urllib.request.Request(
+        f"{GATEWAY}/v1/chat/completions",
+        data=json.dumps(
+            {
+                "model": "gpt-4o-mini",
+                "stream": True,
+                "messages": [{"role": "user", "content": "TRIGGER_BLOCKED_TOOL_STREAM"}],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        assert resp.status == 200, f"expected 200 stream start, got {resp.status}"
+        req_id = get_header(dict(resp.headers), "X-Gateway-Request-Id")
+        raw_sse = resp.read().decode("utf-8")
+
+    found_error = None
+    for line in raw_sse.splitlines():
+        if line.startswith("data:"):
+            data_str = line[len("data:"):].strip()
+            if data_str and data_str != "[DONE]":
+                try:
+                    parsed = json.loads(data_str)
+                except Exception:
+                    continue
+                if isinstance(parsed, dict) and "error" in parsed:
+                    found_error = parsed["error"]
+                    break
+
+    assert found_error is not None, f"expected guardrail error SSE frame, got: {raw_sse}"
+    assert "drop_database" in json.dumps(found_error, ensure_ascii=False), (
+        f"guardrail error did not mention drop_database: {found_error}"
+    )
+
+    # Verify GET /api/inspector recorded status == "guardrail_blocked" with blocked_reason
+    entry = None
+    for _ in range(10):
+        st_i, _, insp = http_json("GET", f"{GATEWAY}/api/inspector?limit=10")
+        assert st_i == 200, f"GET /api/inspector failed: {st_i} {insp}"
+        entries = insp.get("entries", [])
+        if req_id:
+            entry = next((e for e in entries if e.get("request_id") == req_id), None)
+        elif entries:
+            entry = entries[0]
+        if entry is not None:
+            break
+        time.sleep(0.05)
+
+    assert entry is not None, f"inspector missing blocked stream entry (req_id={req_id})"
+    assert entry.get("status") == "guardrail_blocked", f"expected guardrail_blocked status: {entry}"
+    assert entry.get("blocked_reason") and "drop_database" in entry["blocked_reason"], (
+        f"expected blocked_reason mentioning drop_database: {entry}"
+    )
+    return f"mid-stream drop_database intercepted; inspector status={entry['status']}"
+
+
+def test_21_live_traffic_inspector_api_and_secret_redaction():
+    reset_all()
+    secret = "sk-ant-inspector1234567890"
+    st, headers, body = http_json(
+        "POST",
+        f"{GATEWAY}/v1/chat/completions",
+        {
+            "model": "gpt-4o-mini",
+            "stream": False,
+            "messages": [{"role": "user", "content": f"Inspect this token: {secret}"}],
+        },
+    )
+    assert st == 200, f"chat request failed: {st} {body}"
+    req_id = get_header(headers, "X-Gateway-Request-Id")
+    assert req_id, f"missing X-Gateway-Request-Id header: {headers}"
+
+    st_list, _, list_body = http_json("GET", f"{GATEWAY}/api/inspector?limit=10")
+    assert st_list == 200, f"GET /api/inspector failed: {st_list} {list_body}"
+    entries = list_body.get("entries", [])
+    assert any(e.get("request_id") == req_id for e in entries), f"req_id {req_id} missing from list: {entries}"
+
+    st_get, _, entry = http_json("GET", f"{GATEWAY}/api/inspector/{req_id}")
+    assert st_get == 200, f"GET /api/inspector/{req_id} failed: {st_get} {entry}"
+    inbound_preview = entry.get("inbound_preview", "")
+    assert "[REDACTED_SECRET]" in inbound_preview, f"expected [REDACTED_SECRET] in inbound_preview: {inbound_preview}"
+    assert secret not in inbound_preview, f"raw secret leaked in inbound_preview: {inbound_preview}"
+
+    ir_summary = json.loads(entry.get("canonical_ir_summary", ""))
+    assert isinstance(ir_summary, dict), f"canonical_ir_summary must be valid JSON object: {ir_summary}"
+
+    st_del, _, del_body = http_json("DELETE", f"{GATEWAY}/api/inspector")
+    assert st_del == 200 and del_body.get("ok") is True, f"DELETE /api/inspector failed: {st_del} {del_body}"
+
+    st_after, _, after_body = http_json("GET", f"{GATEWAY}/api/inspector?limit=10")
+    assert st_after == 200 and after_body.get("entries") == [], f"inspector buffer not cleared: {after_body}"
+    return f"req_id={req_id[:8]} redacted, canonical_ir_summary parsed, DELETE cleared buffer"
+
+
+def test_22_expanded_12_builtin_client_profiles():
+    st, _, body = http_json("GET", f"{GATEWAY}/api/clients")
+    assert st == 200, f"GET /api/clients failed: {st} {body}"
+    profiles = body.get("profiles", [])
+    ids = {p["id"] for p in profiles}
+    expected_12 = {
+        "claude_code",
+        "codex",
+        "gemini_cli",
+        "cursor",
+        "cline_roo",
+        "cherry_studio",
+        "trae",
+        "deepseek_harness",
+        "opencode",
+        "claude_desktop",
+        "aider",
+        "generic_sdk",
+    }
+    missing = expected_12 - ids
+    assert not missing, f"missing built-in client profiles: {missing} (got {sorted(ids)})"
+    for highlighted in ("deepseek_harness", "opencode", "claude_desktop", "aider"):
+        assert highlighted in ids, f"expected profile '{highlighted}' in /api/clients"
+    return f"all {len(expected_12)} built-in profiles verified (incl. deepseek_harness, opencode, claude_desktop, aider)"
+
+
 if __name__ == "__main__":
     tests = [
         ("1. Session Stickiness (no X-Session-Id)", test_1_session_stickiness_without_session_id),
@@ -952,6 +1148,10 @@ if __name__ == "__main__":
         ("16. v0.5.0 Local Savings & Stop-Loss Telemetry Dashboard", test_16_local_savings_and_stop_loss_analytics),
         ("17. v0.5.0 Trajectory Studio Fork/Diff Markdown Export & Redaction", test_17_trajectory_studio_fork_diff_markdown_export_redacts_secrets),
         ("18. v1.0.0 Web Console Static Hosting & Browser HTTP API Auth", test_18_web_console_static_hosting_and_browser_http_api),
+        ("19. v1.1.0 OpenAI Responses API Native & Cross-Protocol", test_19_openai_responses_api_native_and_cross_protocol),
+        ("20. v1.1.0 Mid-Stream Guardrail Blocks High-Risk Tool", test_20_streaming_guardrail_blocks_high_risk_tool_midstream),
+        ("21. v1.1.0 Live Traffic Inspector API & Secret Redaction", test_21_live_traffic_inspector_api_and_secret_redaction),
+        ("22. v1.1.0 Expanded 12 Built-In Client Profiles", test_22_expanded_12_builtin_client_profiles),
     ]
     failed = 0
     for name, fn in tests:

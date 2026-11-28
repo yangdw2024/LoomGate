@@ -4,6 +4,7 @@ pub mod codec;
 pub mod config;
 pub mod engine;
 pub mod error_gov;
+pub mod inspector;
 pub mod ir;
 pub mod local_discovery;
 pub mod middleware;
@@ -25,14 +26,16 @@ pub use engine::{
     AuthSettings, ChannelTestResult, GatewayEngine, GatewayError, GatewayResponse, ResponseMetadata,
 };
 pub use error_gov::ErrorTier;
+pub use inspector::{LiveTrafficInspector, TrafficInspectEntry, DEFAULT_INSPECTOR_CAPACITY};
 pub use ir::{CanonicalRequest, CanonicalStreamEvent, CanonicalUsage};
 pub use local_discovery::{
     build_local_channel_config, discover_local_providers, DiscoveredLocalProvider, LocalProbeSpec,
     LocalProviderKind,
 };
 pub use middleware::{
-    mcp_bridge::McpServerConfig, Middleware, MiddlewareContext, MiddlewarePipeline,
-    MiddlewareRejection,
+    guardrail::StreamGuardrailChecker,
+    mcp_bridge::{McpServerConfig, McpTransport},
+    Middleware, MiddlewareContext, MiddlewarePipeline, MiddlewareRejection,
 };
 pub use router::{ChannelHealth, ChannelSnapshot};
 pub use trajectory::{

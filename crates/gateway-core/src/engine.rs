@@ -2,6 +2,7 @@ use crate::cloud_sync::{CloudSessionStatus, CloudSyncClient};
 use crate::codec::{codec_for, CodecError};
 use crate::config::{ChannelConfig, ConfigError, GatewayConfig, RouteMode, UpstreamProtocol};
 use crate::error_gov::{classify_upstream_error, ErrorTier};
+use crate::inspector::{LiveTrafficInspector, TrafficInspectEntry};
 use crate::ir::{CanonicalRequest, CanonicalStreamEvent, CanonicalUsage, ContentPart};
 use crate::local_discovery::{build_local_channel_config, DiscoveredLocalProvider};
 use crate::middleware::guardrail::GuardrailMiddleware;
@@ -270,9 +271,11 @@ pub struct GatewayEngine {
     router: Arc<StickyP2cRouter>,
     signatures: Arc<SignatureCache>,
     trajectory: Arc<TrajectoryStore>,
+    inspector: Arc<LiveTrafficInspector>,
     cloud: Arc<CloudSyncClient>,
     middleware: MiddlewarePipeline,
     rate_limiter: Arc<IngressRateLimitMiddleware>,
+    guardrail: Arc<GuardrailMiddleware>,
     memory: Arc<ContextMemoryMiddleware>,
     mcp_bridge: Arc<McpBridgeMiddleware>,
     /// Hot-switchable global route mode (0 = Lock, 1 = StageAware) toggled from Tauri Tray.
@@ -341,20 +344,23 @@ impl GatewayEngine {
 
         let mut middleware = MiddlewarePipeline::new();
         middleware.push(Arc::clone(&rate_limiter) as Arc<dyn crate::middleware::Middleware>);
-        middleware.push(guardrail);
+        middleware.push(Arc::clone(&guardrail) as Arc<dyn crate::middleware::Middleware>);
         middleware.push(Arc::clone(&memory) as Arc<dyn crate::middleware::Middleware>);
         middleware.push(Arc::clone(&mcp_bridge) as Arc<dyn crate::middleware::Middleware>);
 
         let cloud = Arc::new(CloudSyncClient::new(http.clone()));
+        let inspector = Arc::new(LiveTrafficInspector::default());
 
         Ok(Self {
             config,
             router,
             signatures,
             trajectory,
+            inspector,
             cloud,
             middleware,
             rate_limiter,
+            guardrail,
             memory,
             mcp_bridge,
             active_route_mode: AtomicU8::new(mode_byte),
@@ -483,7 +489,9 @@ impl GatewayEngine {
         cfg.normalize();
         let probe_url = match cfg.protocol {
             UpstreamProtocol::Gemini => format!("{}/v1beta/models", cfg.base_url),
-            UpstreamProtocol::Anthropic | UpstreamProtocol::OpenAi => {
+            UpstreamProtocol::Anthropic
+            | UpstreamProtocol::OpenAi
+            | UpstreamProtocol::OpenAiResponses => {
                 format!("{}/v1/models", cfg.base_url)
             }
         };
@@ -532,7 +540,9 @@ impl GatewayEngine {
             UpstreamProtocol::Anthropic => req
                 .header("x-api-key", &cfg.api_key)
                 .header("anthropic-version", "2023-06-01"),
-            UpstreamProtocol::OpenAi => req.bearer_auth(&cfg.api_key),
+            UpstreamProtocol::OpenAi | UpstreamProtocol::OpenAiResponses => {
+                req.bearer_auth(&cfg.api_key)
+            }
             UpstreamProtocol::Gemini => req.header("x-goog-api-key", &cfg.api_key),
         };
 
@@ -561,7 +571,9 @@ impl GatewayEngine {
             let mut q_req = client.get(q_url);
             q_req = match cfg.protocol {
                 UpstreamProtocol::Anthropic => q_req.header("x-api-key", &cfg.api_key),
-                UpstreamProtocol::OpenAi => q_req.bearer_auth(&cfg.api_key),
+                UpstreamProtocol::OpenAi | UpstreamProtocol::OpenAiResponses => {
+                    q_req.bearer_auth(&cfg.api_key)
+                }
                 UpstreamProtocol::Gemini => q_req.header("x-goog-api-key", &cfg.api_key),
             };
             match q_req.send().await {
@@ -758,6 +770,19 @@ impl GatewayEngine {
         self.signatures.clear();
         self.rate_limiter.reset();
         self.memory.clear();
+        self.inspector.clear();
+    }
+
+    pub fn list_traffic(&self, limit: usize) -> Vec<TrafficInspectEntry> {
+        self.inspector.list(limit)
+    }
+
+    pub fn get_traffic(&self, request_id: &str) -> Option<TrafficInspectEntry> {
+        self.inspector.get(request_id)
+    }
+
+    pub fn clear_traffic(&self) {
+        self.inspector.clear();
     }
 
     pub fn active_route_mode(&self) -> RouteMode {
@@ -828,6 +853,7 @@ impl GatewayEngine {
 
         let protocol = match original.protocol.as_str() {
             "openai" => UpstreamProtocol::OpenAi,
+            "openai_responses" => UpstreamProtocol::OpenAiResponses,
             "gemini" => UpstreamProtocol::Gemini,
             _ => UpstreamProtocol::Anthropic,
         };
@@ -938,12 +964,44 @@ impl GatewayEngine {
             .await;
 
         match mw_outcome {
-            Err(rej) => Err(GatewayError::MiddlewareRejected {
-                status: rej.status,
-                error_type: rej.error_type,
-                message: rej.message,
-                middleware: rej.middleware,
-            }),
+            Err(rej) => {
+                self.inspector.record(TrafficInspectEntry {
+                    request_id: request_id.clone(),
+                    ts_ms: now_epoch_ms().max(0) as u64,
+                    downstream_protocol: protocol_label(downstream_protocol).into(),
+                    upstream_protocol: "none".into(),
+                    requested_model: payload
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    actual_model: "blocked".into(),
+                    channel_id: rej.middleware.into(),
+                    route_mode: match self.active_route_mode() {
+                        RouteMode::Lock => "lock".into(),
+                        RouteMode::StageAware => "stage_aware".into(),
+                    },
+                    sticky_hit: false,
+                    stream: payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+                    ttft_ms: 0,
+                    status: format!("rejected_{}", rej.status),
+                    input_tokens: 0,
+                    cache_read_tokens: 0,
+                    output_tokens: 0,
+                    guardrail_redactions: 0,
+                    blocked_reason: Some(rej.message.clone()),
+                    inbound_preview: serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                    canonical_ir_summary: json!({ "rejected_by": rej.middleware }).to_string(),
+                    upstream_preview: String::new(),
+                    sse_events: vec![],
+                });
+                Err(GatewayError::MiddlewareRejected {
+                    status: rej.status,
+                    error_type: rej.error_type,
+                    message: rej.message,
+                    middleware: rej.middleware,
+                })
+            }
             Ok((final_ctx, Ok(mut resp))) => {
                 match &mut resp {
                     GatewayResponse::Streaming { meta, .. }
@@ -1029,7 +1087,7 @@ impl GatewayEngine {
                         .header("x-api-key", &channel.config.api_key)
                         .header("anthropic-version", "2023-06-01")
                         .header("X-Gateway-Prefix-Key", &decision.prefix_key),
-                    UpstreamProtocol::OpenAi => req_builder
+                    UpstreamProtocol::OpenAi | UpstreamProtocol::OpenAiResponses => req_builder
                         .bearer_auth(&channel.config.api_key)
                         .header("X-Gateway-Prefix-Key", &decision.prefix_key),
                     UpstreamProtocol::Gemini => req_builder
@@ -1071,6 +1129,7 @@ impl GatewayEngine {
                         let proto_str = match downstream_protocol {
                             UpstreamProtocol::Anthropic => "anthropic",
                             UpstreamProtocol::OpenAi => "openai",
+                            UpstreamProtocol::OpenAiResponses => "openai_responses",
                             UpstreamProtocol::Gemini => "gemini",
                         }
                         .to_string();
@@ -1079,6 +1138,16 @@ impl GatewayEngine {
                             RouteMode::StageAware => "stage_aware",
                         }
                         .to_string();
+
+                        let guardrail_redactions = mw_ctx
+                            .annotations
+                            .get("X-Gateway-Guardrail-Redactions")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let canonical_ir_summary = summarize_canonical_ir(canonical);
+                        let upstream_preview =
+                            serde_json::to_string_pretty(&encoded_body).unwrap_or_default();
+                        let upstream_proto_str = protocol_label(channel.config.protocol).to_string();
 
                         if canonical.stream {
                             let cancel_token = CancellationToken::new();
@@ -1089,7 +1158,9 @@ impl GatewayEngine {
                             let bg_metrics = Arc::clone(&metrics);
                             let bg_signatures = Arc::clone(&self.signatures);
                             let bg_traj = Arc::clone(&self.trajectory);
+                            let bg_inspector = Arc::clone(&self.inspector);
                             let bg_cloud = Arc::clone(&self.cloud);
+                            let mut stream_guardrail = self.guardrail.stream_checker();
                             let bg_req_id = request_id.clone();
                             let prefix_key = decision.prefix_key.clone();
                             let upstream_proto = channel.config.protocol;
@@ -1116,14 +1187,16 @@ impl GatewayEngine {
                                 let mut acc_tools: Vec<Value> = Vec::new();
                                 let mut acc_usage = CanonicalUsage::default();
                                 let mut status_label = "completed";
+                                let mut blocked_reason: Option<String> = None;
+                                let mut sse_events_log: Vec<String> = Vec::new();
 
-                                loop {
+                                'stream_loop: loop {
                                     tokio::select! {
                                         biased;
                                         _ = bg_token.cancelled() => {
                                             drop(byte_stream);
                                             status_label = "aborted_by_client";
-                                            break;
+                                            break 'stream_loop;
                                         }
                                         maybe_chunk = byte_stream.next() => {
                                             match maybe_chunk {
@@ -1133,6 +1206,23 @@ impl GatewayEngine {
                                                         let raw_events = up_codec.decode_sse_frame(frame.event.as_deref(), &frame.data);
                                                         for raw_ev in raw_events {
                                                             for ev in normalizer.normalize(raw_ev) {
+                                                                if sse_events_log.len() < 64 {
+                                                                    sse_events_log.push(stream_event_label(&ev).into());
+                                                                }
+                                                                if stream_guardrail.is_enabled() {
+                                                                    if let Err(reason) = stream_guardrail.check_event(&ev) {
+                                                                        status_label = "guardrail_blocked";
+                                                                        blocked_reason = Some(reason.clone());
+                                                                        let err_ev = CanonicalStreamEvent::Error { message: reason };
+                                                                        for out_sse in down_codec.encode_sse_event(&err_ev) {
+                                                                            bg_metrics.add_output_bytes(out_sse.len() as u64);
+                                                                            let _ = tx.send(Ok(Bytes::from(out_sse))).await;
+                                                                        }
+                                                                        bg_token.cancel();
+                                                                        drop(byte_stream);
+                                                                        break 'stream_loop;
+                                                                    }
+                                                                }
                                                                 match &ev {
                                                                     CanonicalStreamEvent::MessageStart { usage: Some(u), .. } => {
                                                                         acc_usage.input_tokens = acc_usage.input_tokens.max(u.input_tokens);
@@ -1157,7 +1247,7 @@ impl GatewayEngine {
                                                                     if tx.send(Ok(Bytes::from(out_sse))).await.is_err() {
                                                                         bg_token.cancel();
                                                                         status_label = "aborted_by_client";
-                                                                        break;
+                                                                        break 'stream_loop;
                                                                     }
                                                                 }
                                                             }
@@ -1170,13 +1260,28 @@ impl GatewayEngine {
                                                         std::io::ErrorKind::BrokenPipe,
                                                         err.to_string(),
                                                     ))).await;
-                                                    break;
+                                                    break 'stream_loop;
                                                 }
                                                 None => {
                                                     for frame in parser.finish() {
                                                         let raw_events = up_codec.decode_sse_frame(frame.event.as_deref(), &frame.data);
                                                         for raw_ev in raw_events {
                                                             for ev in normalizer.normalize(raw_ev) {
+                                                                if sse_events_log.len() < 64 {
+                                                                    sse_events_log.push(stream_event_label(&ev).into());
+                                                                }
+                                                                if stream_guardrail.is_enabled() {
+                                                                    if let Err(reason) = stream_guardrail.check_event(&ev) {
+                                                                        status_label = "guardrail_blocked";
+                                                                        blocked_reason = Some(reason.clone());
+                                                                        let err_ev = CanonicalStreamEvent::Error { message: reason };
+                                                                        for out_sse in down_codec.encode_sse_event(&err_ev) {
+                                                                            bg_metrics.add_output_bytes(out_sse.len() as u64);
+                                                                            let _ = tx.send(Ok(Bytes::from(out_sse))).await;
+                                                                        }
+                                                                        break 'stream_loop;
+                                                                    }
+                                                                }
                                                                 match &ev {
                                                                     CanonicalStreamEvent::TextDelta { text, .. } => {
                                                                         acc_text.push_str(text);
@@ -1194,7 +1299,7 @@ impl GatewayEngine {
                                                         }
                                                     }
                                                     bg_metrics.completed.store(1, Ordering::Relaxed);
-                                                    break;
+                                                    break 'stream_loop;
                                                 }
                                             }
                                         }
@@ -1215,7 +1320,7 @@ impl GatewayEngine {
                                     turn_index,
                                     protocol: proto_str.clone(),
                                     channel_id: channel_id.clone(),
-                                    requested_model,
+                                    requested_model: requested_model.clone(),
                                     actual_model: actual_model.clone(),
                                     route_mode: mode_str.clone(),
                                     sticky_hit,
@@ -1224,12 +1329,36 @@ impl GatewayEngine {
                                     cache_read_tokens: acc_usage.cache_read_input_tokens,
                                     output_tokens: final_out_tokens,
                                     status: status_label.into(),
-                                    request_json: req_json_bg,
+                                    request_json: req_json_bg.clone(),
                                     response_text: acc_text,
                                     tool_calls_json: serde_json::to_string(&acc_tools).unwrap_or_else(|_| "[]".into()),
                                     created_at_ms: now_epoch_ms(),
                                 };
                                 let _ = bg_traj.append_step(&step);
+
+                                bg_inspector.record(TrafficInspectEntry {
+                                    request_id: bg_req_id.clone(),
+                                    ts_ms: now_epoch_ms().max(0) as u64,
+                                    downstream_protocol: proto_str.clone(),
+                                    upstream_protocol: upstream_proto_str,
+                                    requested_model,
+                                    actual_model: actual_model.clone(),
+                                    channel_id: channel_id.clone(),
+                                    route_mode: mode_str.clone(),
+                                    sticky_hit,
+                                    stream: true,
+                                    ttft_ms,
+                                    status: status_label.into(),
+                                    input_tokens: acc_usage.input_tokens,
+                                    cache_read_tokens: acc_usage.cache_read_input_tokens,
+                                    output_tokens: final_out_tokens,
+                                    guardrail_redactions,
+                                    blocked_reason,
+                                    inbound_preview: req_json_bg,
+                                    canonical_ir_summary,
+                                    upstream_preview,
+                                    sse_events: sse_events_log,
+                                });
 
                                 if cloud_reserved {
                                     bg_cloud
@@ -1309,12 +1438,36 @@ impl GatewayEngine {
                                 cache_read_tokens: canonical_resp.usage.cache_read_input_tokens,
                                 output_tokens: canonical_resp.usage.output_tokens,
                                 status: "completed".into(),
-                                request_json: raw_request_json,
+                                request_json: raw_request_json.clone(),
                                 response_text: canonical_resp.concatenated_text(),
                                 tool_calls_json: "[]".into(),
                                 created_at_ms: now_epoch_ms(),
                             };
                             let _ = self.trajectory.append_step(&step);
+
+                            self.inspector.record(TrafficInspectEntry {
+                                request_id: request_id.clone(),
+                                ts_ms: now_epoch_ms().max(0) as u64,
+                                downstream_protocol: proto_str.clone(),
+                                upstream_protocol: upstream_proto_str,
+                                requested_model: canonical.model.clone(),
+                                actual_model: upstream_model.clone(),
+                                channel_id: channel.config.id.clone(),
+                                route_mode: mode_str.clone(),
+                                sticky_hit: decision.sticky_hit,
+                                stream: false,
+                                ttft_ms,
+                                status: "completed".into(),
+                                input_tokens: canonical_resp.usage.input_tokens,
+                                cache_read_tokens: canonical_resp.usage.cache_read_input_tokens,
+                                output_tokens: canonical_resp.usage.output_tokens,
+                                guardrail_redactions,
+                                blocked_reason: None,
+                                inbound_preview: raw_request_json,
+                                canonical_ir_summary,
+                                upstream_preview,
+                                sse_events: vec![],
+                            });
 
                             if cloud_reserved {
                                 self.cloud
@@ -1443,6 +1596,48 @@ impl GatewayEngine {
     }
 }
 
+fn protocol_label(protocol: UpstreamProtocol) -> &'static str {
+    match protocol {
+        UpstreamProtocol::Anthropic => "anthropic",
+        UpstreamProtocol::OpenAi => "openai",
+        UpstreamProtocol::OpenAiResponses => "openai_responses",
+        UpstreamProtocol::Gemini => "gemini",
+    }
+}
+
+fn stream_event_label(ev: &CanonicalStreamEvent) -> &'static str {
+    match ev {
+        CanonicalStreamEvent::MessageStart { .. } => "message_start",
+        CanonicalStreamEvent::ContentBlockStart { .. } => "content_block_start",
+        CanonicalStreamEvent::ContentBlockStop { .. } => "content_block_stop",
+        CanonicalStreamEvent::TextDelta { .. } => "text_delta",
+        CanonicalStreamEvent::ThinkingDelta { .. } => "thinking_delta",
+        CanonicalStreamEvent::SignatureDelta { .. } => "signature_delta",
+        CanonicalStreamEvent::ToolCallStart { .. } => "tool_call_start",
+        CanonicalStreamEvent::ToolCallDelta { .. } => "tool_call_delta",
+        CanonicalStreamEvent::UsageDelta { .. } => "usage_delta",
+        CanonicalStreamEvent::MessageStop { .. } => "message_stop",
+        CanonicalStreamEvent::Error { .. } => "error",
+    }
+}
+
+fn summarize_canonical_ir(req: &CanonicalRequest) -> String {
+    let tool_names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+    json!({
+        "model": req.model,
+        "stream": req.stream,
+        "system_parts": req.system.len(),
+        "messages": req.messages.len(),
+        "tools": tool_names,
+        "has_cache_breakpoints": req.has_cache_breakpoints(),
+        "has_reasoning": req.reasoning.is_some(),
+        "has_thought_signature": req.opaque_state.thought_signature.is_some(),
+        "session_id": req.session_id,
+        "task_stage": req.task_stage,
+    })
+    .to_string()
+}
+
 fn upstream_endpoint(
     base_url: &str,
     protocol: UpstreamProtocol,
@@ -1453,6 +1648,7 @@ fn upstream_endpoint(
     match protocol {
         UpstreamProtocol::Anthropic => format!("{}/v1/messages", trimmed),
         UpstreamProtocol::OpenAi => format!("{}/v1/chat/completions", trimmed),
+        UpstreamProtocol::OpenAiResponses => format!("{}/v1/responses", trimmed),
         UpstreamProtocol::Gemini => {
             if stream {
                 format!(

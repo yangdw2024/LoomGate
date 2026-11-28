@@ -22,7 +22,7 @@ export interface ChannelSnapshot {
 
 export interface ChannelConfig {
   id: string;
-  protocol: "anthropic" | "openai" | "gemini";
+  protocol: "anthropic" | "openai" | "openai_responses" | "gemini";
   base_url: string;
   api_key: string;
   weight: number;
@@ -164,6 +164,30 @@ export interface CloudSessionStatus {
   available_micros: number | null;
   telemetry_uploaded: number;
   last_sync_ms: number | null;
+}
+
+export interface TrafficInspectEntry {
+  request_id: string;
+  ts_ms: number;
+  downstream_protocol: string;
+  upstream_protocol: string;
+  requested_model: string;
+  actual_model: string;
+  channel_id: string;
+  route_mode: string;
+  sticky_hit: boolean;
+  stream: boolean;
+  ttft_ms: number;
+  status: string;
+  input_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  guardrail_redactions: number;
+  blocked_reason: string | null;
+  inbound_preview: string;
+  canonical_ir_summary: string;
+  upstream_preview: string;
+  sse_events: string[];
 }
 
 export interface GatewayStatus {
@@ -539,5 +563,42 @@ export const gatewayClient = {
       forked_step_id: forkedStepId,
       redact_secrets: redactSecrets,
     });
+  },
+
+  async listTrafficInspector(limit = 50): Promise<TrafficInspectEntry[]> {
+    if (isTauriRuntime()) {
+      return await invoke<TrafficInspectEntry[]>("list_traffic_inspector", { limit });
+    }
+    const res = await httpJson<{ entries: TrafficInspectEntry[] }>(
+      "GET",
+      `/api/inspector?limit=${encodeURIComponent(String(limit))}`
+    );
+    return res.entries || [];
+  },
+
+  async getTrafficInspectorEntry(requestId: string): Promise<TrafficInspectEntry | null> {
+    if (isTauriRuntime()) {
+      return await invoke<TrafficInspectEntry | null>("get_traffic_inspector_entry", { requestId });
+    }
+    try {
+      return await httpJson<TrafficInspectEntry>(
+        "GET",
+        `/api/inspector/${encodeURIComponent(requestId)}`
+      );
+    } catch (e) {
+      if (e instanceof AdminAuthRequiredError) throw e;
+      if (e instanceof Error && e.message.toLowerCase().includes("not found")) {
+        return null;
+      }
+      throw e;
+    }
+  },
+
+  async clearTrafficInspector(): Promise<boolean> {
+    if (isTauriRuntime()) {
+      return await invoke<boolean>("clear_traffic_inspector");
+    }
+    const res = await httpJson<{ ok?: boolean }>("DELETE", "/api/inspector");
+    return Boolean(res?.ok ?? true);
   },
 };
