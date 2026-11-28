@@ -2,106 +2,104 @@
 
 # LoomGate
 
-**面向全生态 AI Agent 的端云协同微内核 AI 网关**
+**专为 Claude Code、Codex CLI、Gemini CLI 与 Cursor 打造的本地优先 Rust AI 网关——告别 Prompt Cache 反复失效、思考签名丢失与 Ctrl+C 断流白扣费。**
 
 [![Release](https://img.shields.io/github/v/release/yangdw2024/LoomGate?color=388bfd&label=Release)](https://github.com/yangdw2024/LoomGate/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/yangdw2024/LoomGate/ci.yml?label=CI)](https://github.com/yangdw2024/LoomGate/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/loomgate?color=3fb950&label=npm%20loomgate)](https://www.npmjs.com/package/loomgate)
-[![Rust](https://img.shields.io/badge/Rust-Workspace-orange.svg)](https://www.rust-lang.org/)
-[![Tauri v2](https://img.shields.io/badge/Tauri-v2-24c8db.svg)](https://v2.tauri.app/)
+[![Rust + Tauri v2](https://img.shields.io/badge/Rust%20%2B%20Tauri%20v2-Microkernel-24c8db.svg)](https://v2.tauri.app/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **[English](README.md)** | **简体中文**
+
+<br />
+
+<!-- 按 docs/assets/SCREENSHOT_GUIDE.md 截取高清图后替换 -->
+<img src="docs/assets/loomgate-trajectory-diff.png" alt="LoomGate Studio — Trajectory Fork & Diff、前缀缓存粘滞路由与本地省钱仪表盘" width="960" />
 
 </div>
 
 ---
 
-**LoomGate** 是一个基于 Rust Workspace + Tauri v2 构建的 **本地隐私优先、端云协同微内核 AI 网关**，全面服务 **Claude Code、Codex CLI、Gemini CLI、Cursor、Cline / Roo Code、Cherry Studio、Trae** 以及任意 **OpenAI / Anthropic / Gemini SDK**。
+普通中转/API 代理在 AI 编程 Agent 场景下经常暗中踩坑：轮询负载均衡每轮打碎 KV Prompt Cache、跨协议转换静默丢弃 `cache_control` 或 `thought_signature`、终端按 `Ctrl+C` 后上游仍在后台扣费生成、想复盘某一轮换个模型重跑对比却无从下手。
 
-同一套微内核与 React 控制台既能以 **原生 Tauri v2 桌面端** 零配置运行，也能通过 **多阶段 Docker 镜像** 一键部署为团队 Web 控制台——同时提供 **三协议无损双向转换**、**Prompt Caching 前缀亲和路由**、**`Ctrl+C` 流式中途断流止损**、**洋葱模型脱敏/拦截中间件**、**Ollama / LM Studio / vLLM 自动发现与断网兜底**，以及 **本地 SQLite WAL 轨迹回放、Fork & Diff 与省钱仪表盘**，完整 Prompt 与响应正文 100% 留存本地。
-
----
-
-## 系统架构
-
-```mermaid
-flowchart TB
-    subgraph Clients["全生态 AI 编程客户端与 SDK"]
-        C1["Claude Code / Codex / Gemini CLI<br/>（原子配置接管 + .bak 无损还原）"]
-        C2["Cursor / Cline / Roo / Cherry Studio / Trae<br/>（交互接入向导 + 自定义 TOML/JSON 注册）"]
-        C3["OpenAI / Anthropic / Gemini SDK<br/>与官方 npm CLI（loomgate）"]
-    end
-
-    subgraph Edge["LoomGate 端侧微内核（127.0.0.1:8787 · Tauri 桌面端 / Docker Web 控制台）"]
-        direction TB
-        API["三协议入口与分离鉴权<br/>/v1/messages · /v1/messages/count_tokens · /v1/chat/completions · /v1beta/models/:action<br/>api_key（推理） | admin_password（管理后台）"]
-        MW["洋葱模型 Middleware 管道<br/>Ingress 限流 → Guardrail（密钥/PII 脱敏与高危工具拦截）→ Context/Memory → MCP 聚合桥接"]
-        IR["无损 Canonical IR + 侧车 SignatureCache<br/>cache_control · thinking/signature · thought_signature · strict 工具 Schema · UTF-8 SSE 状态机与 Drop 断流"]
-        RTR["前缀缓存粘滞 + P2C 负载均衡路由<br/>Lock（绝不静默降级） | Stage-Aware | 单渠道 HTTP/SOCKS5 代理 | 断网本地兜底"]
-        DB[("本地 SQLite WAL 轨迹库<br/>原始正文 100% 留存本机<br/>Fork & Diff · 省钱仪表盘 · 脱敏导出分享")]
-        API --> MW --> IR --> RTR
-        RTR --> DB
-    end
-
-    subgraph Upstreams["上游推理渠道"]
-        U1["云端模型渠道<br/>Anthropic · OpenAI · Gemini"]
-        U2["本机自动发现推理服务<br/>Ollama · LM Studio · vLLM（Offline Fallback）"]
-    end
-
-    subgraph Cloud["可选云端控制面（:8790）"]
-        CP["PostgreSQL 团队号池热同步<br/>Redis Lua 两阶段原子预扣/结算<br/>ClickHouse 仅上报脱敏元数据"]
-    end
-
-    Clients --> API
-    RTR --> U1
-    RTR -. "云端全熔断/断网自动承接" .-> U2
-    Edge -. "仅上报 SHA-256 会话哈希与数值指标" .-> Cloud
-```
+**LoomGate** 采用单一 Rust 微内核（`gateway-core`），一套前端同时运行于 **Tauri v2 原生桌面端** 与 **Docker Web 管理后台**，完整解决上述痛点，且 **100% 原始 Prompt 与响应正文仅留存本地 SQLite WAL**。
 
 ---
 
-## 核心能力对比（对比传统代理与单客户端工具）
+## 为什么选择 LoomGate？（对比直连与普通代理）
 
-| 能力维度 | LoomGate v1.0.0 | 传统代理（One-API / LiteLLM） | 单工具切换器（CC-Switch） |
+| 核心能力 | 直连模型厂商 | 普通中转/代理（LiteLLM / One-API） | **LoomGate (`v1.0.0`)** |
 |---|:---:|:---:|:---:|
-| **三协议无损 Canonical IR**（`cache_control`、`thinking/signature`、`thought_signature`、`strict` Schema） | Rust 原生 IR + 侧车缓存 | 易静默丢字段或仅裸透传 | 无跨协议转换 |
-| **绝不静默降级（`Lock` 模式）** + 透明响应头 | 严格锁定 + `X-Gateway-Actual-Model` | 常存在隐式模型替换 | 仅修改本地配置文件 |
-| **Claude CLI `/v1/messages/count_tokens` 预检**（跨 OpenAI / Gemini 上游） | 原生透传 + IR 估算无缝兜底 | 切到非 Anthropic 上游易 404 | 不支持 |
-| **`Ctrl+C` 流式中途断流止损**（Drop 传导） | 毫秒级断开上游 TCP + WAL 记账 | 上游继续生成扣费 | 无数据面 |
-| **本机模型零配置发现与断网兜底**（Ollama / LM Studio / vLLM） | `<= 350ms` 并行探测 + 一键导入 | 需手动写 YAML / 录入数据库 | 不支持 |
-| **轨迹 Fork & Diff + 脱敏导出分享**（Markdown / SVG / PNG） | SQLite WAL + 纯 Canvas 2D 分享图 | 无 | 无 |
-| **一套 React 前端跑双端**（桌面原生 + Docker Web 团队控制台） | Tauri v2 IPC + 浏览器 REST（`sessionStorage`） | 仅重型 Web 服务 | 仅桌面端 |
-| **本地隐私优先** | 原始 Prompt 仅存本地 SQLite | 中心服务器落盘明文 | 本地 |
+| **三协议无损 Canonical IR**（Anthropic / OpenAI / Gemini） | 仅单厂商 | 易丢弃 `cache_control`、`thinking/signature`、`thought_signature` 或 `strict` 工具 Schema | **无损统一 IR + 侧车 `SignatureCache`**（客户端剥离签名也能跨轮自动回填） |
+| **Prompt Caching 前缀亲和路由** | 绑定单 Key | 轮询/随机分发导致多渠道 KV 缓存反复失效 | **Turn-1 稳定前缀指纹 + 粘滞 P2C 路由**，无 `X-Session-Id` 也能锁定同渠道 |
+| **绝不静默降级** | 不适用 | 失败回退可能静默切换廉价模型 | 显式 **`Lock` 模式**（绝不降级）与 **`Stage-Aware`**，响应必带 `X-Gateway-Actual-Model` |
+| **流式 `Ctrl+C` 断流止损** | 视客户端而定 | 客户端断开后代理常继续拉完上游流并扣费 | **零缓冲 UTF-8 SSE 状态机 + Drop 断流传导**，`< 1s` 断开上游 TCP 并记录 `aborted_by_client` |
+| **Claude CLI `/v1/messages/count_tokens` 预检** | 仅 Anthropic | 切到 OpenAI / Gemini 上游经常 404 | **原生透传 + Canonical IR 确定性估算兜底**，跨协议零报错 |
+| **SQLite WAL 轨迹分叉与 Diff 回溯** | 无 | 仅中心日志，无法按轮分叉重放 | **本地仅追加轨迹树**：任意历史轮次一键 Fork 到其他模型、行级高亮 Diff、默认脱敏导出 Markdown/SVG/PNG |
+| **本机模型自动发现与断网兜底** | 无 | 需手工维护配置 | **`<= 350ms` 并行探测** Ollama（`:11434`）/ LM Studio（`:1234`）/ vLLM（`:8000`），云端全熔断自动 `offline_fallback` |
+| **隐私边界** | 上送厂商 | 中心化代理服务器落盘完整 Prompt | **原始正文 100% 留存本地 SQLite WAL**；可选云端控制面仅接收 SHA-256 哈希与数值指标 |
 
 ---
 
-## 30 秒极速上手
+## 5 分钟极速接入
 
-三种形态共享同一套 `gateway-core` 微内核，按需选择：
+### 第一步：安装并启动 LoomGate（默认监听 `127.0.0.1:8787`）
 
-### 方式一：下载原生桌面安装包（个人开发者推荐，零配置开箱）
-前往 **[GitHub Releases](https://github.com/yangdw2024/LoomGate/releases)** 下载对应平台安装包：
-- **Windows**：`LoomGate_1.0.0_x64-setup.exe`（NSIS）或 `.msi`
-- **macOS**：`LoomGate_1.0.0_aarch64.dmg`
-- **Linux**：`LoomGate_1.0.0_amd64.AppImage` / `.deb` / `.rpm`
+- **桌面端安装包（推荐，零配置开箱）** — 前往 **[GitHub Releases (`v1.0.0`)](https://github.com/yangdw2024/LoomGate/releases/tag/v1.0.0)** 下载：
+  - **Windows**：`LoomGate_1.0.0_x64-setup.exe`（NSIS）或 `LoomGate_1.0.0_x64_en-US.msi`（MSI）
+  - **macOS (Apple Silicon)**：`LoomGate_1.0.0_aarch64.dmg`（或 `LoomGate_aarch64.app.tar.gz`）
+  - **Linux**：`LoomGate_1.0.0_amd64.AppImage`、`LoomGate_1.0.0_amd64.deb` 或 `LoomGate-1.0.0-1.x86_64.rpm`
+  - 打开 **Channels & Routing** → 点击 **+ Add Channel**（或 **Scan Local Models**）→ 点击 **Test** 测速。
+- **Docker Compose（网关 + 内置 Web 管理后台 `http://localhost:8787`）**：
+  ```bash
+  git clone https://github.com/yangdw2024/LoomGate.git
+  cd LoomGate
+  docker compose -f deploy/docker-compose.yml up -d
+  ```
+- **源码启动（Rust Daemon）**：
+  ```bash
+  cp config.example.toml config.local.toml   # 填入真实 base_url 与 api_key（已被 .gitignore 排除）
+  GATEWAY_CONFIG=config.local.toml cargo run -p gateway-daemon
+  ```
 
-启动 **LoomGate Studio** → 点击 **Scan Local Models** 自动扫描本机 Ollama / LM Studio / vLLM，或点击 **+ Add Channel** 添加云端渠道并点击 **Test** 测速 → 切到 **Client Integrations** 一键接管 Claude Code / Codex / Gemini CLI 或复制 Cursor / Cline / Cherry Studio / Trae 配置。
+### 第二步：复制命令接入你的编程 Agent
 
-### 方式二：Docker Compose 一键部署（三协议网关 + 内置 Web 管理后台）
+> 在 **LoomGate Studio → Client Integrations** 页签中，Claude Code / Codex CLI / Gemini CLI 还支持**一键原子接管与 `.bak` 无损还原**。若你配置了 `api_key`，将下方 `local-loomgate` 替换为你的密钥即可。
+
+#### Claude Code
 ```bash
-git clone https://github.com/yangdw2024/LoomGate.git
-cd LoomGate
-docker compose -f deploy/docker-compose.yml up -d
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+export ANTHROPIC_AUTH_TOKEN="local-loomgate"
+claude
 ```
-- **Web 管理控制台**：浏览器直接打开 `http://localhost:8787`（若启用了 `admin_password`，密码仅保存在浏览器 `sessionStorage` 并经 `x-admin-password` 透传，关闭标签页即销毁）。
-- **三协议网关入口**：所有客户端直接指向 `http://localhost:8787`。
-- **可选云端控制面**：加 `--profile cloud` 同步拉起 `:8790` 团队控制面。
 
-### 方式三：官方零依赖 npm SDK & CLI（`loomgate`）
+#### Codex CLI
+写入 `~/.codex/config.toml`（或在 Studio 点击 **Take Over**）：
+```toml
+openai_base_url = "http://127.0.0.1:8787/v1"
+```
+或环境变量：
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:8787/v1"
+export OPENAI_API_KEY="local-loomgate"
+```
+
+#### Gemini CLI
+```bash
+export GEMINI_API_BASE_URL="http://127.0.0.1:8787"
+export GEMINI_API_KEY="local-loomgate"
+gemini
+```
+
+#### Cursor
+1. 打开 **Cursor Settings → Models → OpenAI API Key**。
+2. 勾选 **Override OpenAI Base URL** 并填入 `http://127.0.0.1:8787/v1`。
+3. API Key 填入 `local-loomgate`（或你配置的 LoomGate `api_key`）。
+
+#### 官方 npm CLI（`loomgate`）
 ```bash
 npm install loomgate
-# 或直接使用 CLI
 npx loomgate status
 npx loomgate local scan
 npx loomgate savings 30
@@ -112,39 +110,54 @@ npx loomgate diff-export <orig_step_id> <fork_step_id>
 
 ---
 
-## 全客户端声明式接入矩阵
+## 可复现验证与省费实测（Benchmark / Cache Hit Proof）
 
-基于 **声明式客户端注册表**（`crates/gateway-core/src/cli_takeover.rs` 与 `GET /api/clients`），无需修改 Rust 代码即可通过 `~/.loomgate/client_profiles.toml` 或 `.json` 扩展任意新 Agent：
+仓库 `tests/` 内置两套可直接复现的验证脚本：
 
-| 客户端 | 接入方式 | 说明 |
-|---|---|---|
-| **Claude Code** | 原子接管（自动 `.bak` 还原） | 原子改写 `~/.claude/settings.json`，完整支持 `/v1/messages/count_tokens` 预检。 |
-| **Codex CLI** | 原子接管（自动 `.bak` 还原） | 原子改写 `~/.codex/config.toml`，一键无损还原。 |
-| **Gemini CLI** | 原子接管（自动 `.bak` 还原） | 原子改写 `~/.gemini/settings.json`，原生支持 `thought_signature` 跨轮回填。 |
-| **Cursor** | 接入向导（一键复制） | 生成 `OPENAI_BASE_URL` 与 JSON 配置片段。 |
-| **Cline / Roo Code** | 接入向导（一键复制） | 支持 Anthropic / OpenAI 兼容模式，完整保留 `cache_control`。 |
-| **Cherry Studio** | 接入向导（一键复制） | 统一三协议聚合供应商模板。 |
-| **Trae** | 接入向导（一键复制） | OpenAI 兼容自定义模型接入模板。 |
-| **通用 SDK** | 接入向导（一键复制） | Python / TypeScript / Go / Rust 环境变量片段。 |
-| **任意自定义 Agent** | 本地 TOML / JSON | 放入 `~/.loomgate/client_profiles.toml`，详见 [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)。 |
+1. **18/18 全量契约与粘滞路由测试（本地 Mock 四渠道集群）**：
+   ```bash
+   cd apps/desktop && npm ci && npm run build && cd ../..
+   cargo build -p gateway-daemon -p cloud-control-plane
+   python3 tests/mock_upstream.py &
+   ./target/debug/cloud-control-plane &
+   GATEWAY_CONFIG=config.example.toml LOOMGATE_WEB_DIST=apps/desktop/dist ./target/debug/gateway-daemon &
+   python3 tests/conformance_suite.py
+   ```
+   覆盖：无 `X-Session-Id` 10 轮 100% 粘滞命中（9/9）、`< 1s` `Ctrl+C` 断流传导、四级错误治理、Anthropic/OpenAI/Gemini 三协议互通与 `thought_signature` 侧车回填、本机模型自动发现与省钱仪表盘聚合。
+
+2. **真实上游缓存命中与止损实测（待填入你的真实账号数据）**：
+   ```bash
+   GATEWAY_CONFIG=config.local.toml cargo run -p gateway-daemon
+   python3 tests/live_upstream_verify.py --anthropic-model claude-sonnet-4-20250514 --openai-model gpt-4o
+   npx loomgate savings 30
+   ```
+
+| 实测场景 | 模型 / 集群 | 粘滞亲和 | 工具调用 / 思考签名 | `Ctrl+C` 止损落库 | 实测观测结果 |
+|---|---|---:|---|---|---|
+| **18/18 契约压测集群**（`conformance_suite.py`） | 4 渠道集群（Anthropic x2 / OpenAI / Gemini） | **9/9（无 `X-Session-Id` 第 1 轮起 100% 锁定）** | 剥离 `thoughtSignature` 第 2 轮自动回填 | `aborted=1, completed=0`（`< 1s` 断流） | 33 请求、**42.2% 平均缓存命中**、估算省费 `$0.03486`、本机模型发现 **356–370 ms** |
+| **真实上游实测**（`live_upstream_verify.py`） | `claude-sonnet-4-6`（Anthropic `/v1/messages`） | **2/2（`X-Gateway-Sticky-Hit: true`）** | `tool_calls=1` 完整往返 | 落库 `aborted_by_client`（估算止损 `$0.012`） | 11,473 input / 371 output tokens（注：该本地中继上游未透出厂商侧 KV 缓存计数） |
+| **真实跨协议实测**（`live_upstream_verify.py`） | `gemini-3.8-flash`（Anthropic → Gemini 原生） | **`X-Gateway-Sticky-Hit: true`** | 820 字节真实 `thoughtSignature` 侧车回填 + `tool_use` 往返 | 落库 `aborted_by_client` | 跨协议零丢字段 |
 
 ---
 
-## 隐私与安全边界
+## 界面实拍（Visual Tour）
 
-1. **本地隐私红线**：完整 Prompt、System 指令、工具参数与响应正文仅存储于本地 SQLite WAL；连接云端控制面时仅上报 SHA-256 哈希会话与数值指标，云端接口会主动拒绝携带明文字段的遥测请求。
-2. **推理与管理分离鉴权**：`api_key`（保护 `/v1/*`、`/v1beta/*`）与 `admin_password`（保护 `/api/*`、`/__admin/*`）严格隔离，未设置时默认保持本机免密体验。
-3. **分享导出默认脱敏**：Fork & Diff 导出 Markdown 报告与 PNG/SVG 分享图默认启用 Guardrail 脱敏（自动清除 `sk-*`、`Bearer <token>`、`AIza*`、`ghp_*`、`AKIA*`、邮箱与手机号）。
-4. 完整安全模型与漏洞披露流程见 [`SECURITY.md`](SECURITY.md)。
+### P2C 渠道池、Lock / Stage-Aware 热切与本机 Ollama 断网兜底
+<img src="docs/assets/loomgate-dashboard-channels.png" alt="LoomGate 渠道池与分离鉴权控制台" width="960" />
+
+### 本地 Prompt Caching 省费与 `Ctrl+C` 断流止损仪表盘
+<img src="docs/assets/loomgate-savings-telemetry.png" alt="LoomGate 本地省钱与止损仪表盘" width="960" />
 
 ---
 
-## 生态扩展与社区治理
+## 扩展文档与社区治理
 
-- **三类泛化扩展指南**（自定义 Agent Profile / `Middleware` Trait 插件 / `ProtocolCodec` Trait 协议）：[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)
-- **贡献指南与本地门禁规范**：[`CONTRIBUTING.md`](CONTRIBUTING.md)
-- **版本更新日志**：[`CHANGELOG.md`](CHANGELOG.md)
+- **视觉截图制作指南**：[`docs/assets/SCREENSHOT_GUIDE.md`](docs/assets/SCREENSHOT_GUIDE.md)
+- **三类泛化扩展指南**（自定义 Agent Profile / `Middleware` 插件 / `ProtocolCodec`）：[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)
+- **隐私安全模型与漏洞披露**：[`SECURITY.md`](SECURITY.md)
+- **贡献指南与门禁规范**：[`CONTRIBUTING.md`](CONTRIBUTING.md)
+- **更新日志**：[`CHANGELOG.md`](CHANGELOG.md)
 
 ## 开源协议
 
-[MIT](LICENSE)
+MIT — 详见 [`LICENSE`](LICENSE)。

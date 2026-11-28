@@ -2,24 +2,43 @@
 
 # LoomGate
 
-**Edge-Cloud Hybrid Microkernel AI Gateway for All AI Agents**
+**The local-first Rust AI gateway built for Claude Code, Codex CLI, Gemini CLI, and Cursor — stop burning prompt cache, losing thinking signatures, or paying for aborted streams.**
 
 [![Release](https://img.shields.io/github/v/release/yangdw2024/LoomGate?color=388bfd&label=Release)](https://github.com/yangdw2024/LoomGate/releases)
-[![CI](https://github.com/yangdw2024/LoomGate/actions/workflows/ci.yml/badge.svg)](https://github.com/yangdw2024/LoomGate/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/yangdw2024/LoomGate/ci.yml?label=CI)](https://github.com/yangdw2024/LoomGate/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/loomgate?color=3fb950&label=npm%20loomgate)](https://www.npmjs.com/package/loomgate)
-[![Rust](https://img.shields.io/badge/Rust-Workspace-orange.svg)](https://www.rust-lang.org/)
-[![Tauri v2](https://img.shields.io/badge/Tauri-v2-24c8db.svg)](https://v2.tauri.app/)
+[![Rust + Tauri v2](https://img.shields.io/badge/Rust%20%2B%20Tauri%20v2-Microkernel-24c8db.svg)](https://v2.tauri.app/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **English** | **[简体中文](README_ZH.md)**
+
+<br />
+
+<!-- Replace with your captured screenshot following docs/assets/SCREENSHOT_GUIDE.md -->
+<img src="docs/assets/loomgate-trajectory-diff.png" alt="LoomGate Studio — Trajectory Fork & Diff, Prefix-Cache Sticky P2C Routing, and Local Savings Telemetry" width="960" />
 
 </div>
 
 ---
 
-**LoomGate** is a local-first, Rust-powered **Edge-Cloud Hybrid Microkernel AI Gateway** designed for modern coding agents (**Claude Code, Codex CLI, Gemini CLI, Cursor, Cline / Roo Code, Cherry Studio, Trae**, and any **OpenAI / Anthropic / Gemini SDK**).
+Ordinary API proxies break coding agents in subtle, expensive ways: round-robin load balancing destroys KV prompt cache every turn, protocol translators silently strip `cache_control` or `thought_signature`, `Ctrl+C` leaves upstream streams billing in the background, and you have no way to replay a bad turn on another model.
 
-One single microkernel runs both your **native Tauri v2 Desktop Studio** and a **Docker-hosted Team Web Console** — delivering **lossless 3-protocol translation**, **Prompt Caching prefix affinity**, **Ctrl+C mid-stream stop-loss**, **onion-model middleware guardrails**, **local Ollama / LM Studio / vLLM offline fallback**, and **SQLite WAL Trajectory Fork & Diff** without ever uploading a single byte of your raw prompts to the cloud.
+**LoomGate** is a single Rust microkernel (`gateway-core`) embedded in a lightweight **Tauri v2 desktop app** (and runnable as a **Docker Web Console**) that fixes all four while keeping **100% of your prompts in local SQLite WAL**.
+
+---
+
+## Why LoomGate vs. Ordinary Proxies
+
+| Capability | Direct to Provider | Ordinary Proxy (LiteLLM / One-API) | **LoomGate (`v1.0.0`)** |
+|---|:---:|:---:|:---:|
+| **Lossless 3-Protocol IR** (`Anthropic` / `OpenAI` / `Gemini`) | Single vendor only | Often drops `cache_control`, `thinking/signature`, `thought_signature`, or `strict` tool schemas | **Lossless Canonical IR + sidecar `SignatureCache`** (auto-rehydrates stripped `thought_signature` across turns) |
+| **Prompt-Cache Prefix Affinity** | Tied to 1 key/account | Round-robin / random routing invalidates KV cache across channels | **Turn-1-stable Prefix-Cache Sticky + P2C Router** pins a session to one healthy channel even without `X-Session-Id` |
+| **Zero Silent Downgrade** | N/A | Silent fallback can quietly swap models | Explicit **`Lock` mode** (never downgrades) vs **`Stage-Aware`**, with `X-Gateway-Actual-Model` on every response |
+| **Mid-Stream `Ctrl+C` Stop-Loss** | Client-dependent | Proxy often drains upstream response after client disconnects | **Zero-buffer UTF-8 SSE FSM with `Drop` cancel propagation** immediately aborts upstream TCP & logs `aborted_by_client` |
+| **Claude CLI `/v1/messages/count_tokens`** | Anthropic only | Frequently 404 when routing Claude Code to OpenAI / Gemini | **Native pass-through + deterministic IR fallback** so Claude CLI preflight never fails |
+| **Trajectory Replay & Fork/Diff** | None | Centralized request logs only (no branching replay) | **Local SQLite WAL append-only tree**: fork any past turn onto another model, line-level diff, Guardrail-redacted Markdown/SVG/PNG export |
+| **Local Offline Fallback** | None | Manual config | **Parallel `<= 350ms` auto-discovery** for Ollama (`:11434`), LM Studio (`:1234`), vLLM (`:8000`) with automatic `offline_fallback` |
+| **Privacy Boundary** | Sent to vendor | Centralized proxy server stores full prompts | **100% local SQLite WAL**; optional cloud control plane accepts **SHA-256 hashed IDs & numeric metrics only** |
 
 ---
 
@@ -27,81 +46,100 @@ One single microkernel runs both your **native Tauri v2 Desktop Studio** and a *
 
 ```mermaid
 flowchart TB
-    subgraph Clients["AI Coding Agents & SDKs"]
-        C1["Claude Code / Codex / Gemini CLI<br/>(Atomic .bak Takeover)"]
-        C2["Cursor / Cline / Roo / Cherry Studio / Trae<br/>(Setup Wizards + Custom TOML/JSON)"]
-        C3["OpenAI / Anthropic / Gemini SDKs<br/>& Official npm CLI (loomgate)"]
+    subgraph Agents["AI Coding Agents & SDKs"]
+        A1["Claude Code / Codex CLI / Gemini CLI<br/>(One-Click Atomic .bak Takeover)"]
+        A2["Cursor / Cline / Roo Code / Cherry Studio / Trae<br/>(Setup Wizards + Custom TOML/JSON Profiles)"]
+        A3["OpenAI / Anthropic / Gemini SDKs & npx loomgate"]
     end
 
-    subgraph Edge["LoomGate Edge Microkernel (127.0.0.1:8787 · Tauri Desktop or Docker Web Console)"]
+    subgraph Kernel["LoomGate Microkernel (127.0.0.1:8787 · Tauri v2 Desktop or Docker Web Console)"]
         direction TB
-        API["Protocol Ingress & Split Auth<br/>/v1/messages · /v1/messages/count_tokens · /v1/chat/completions · /v1beta/models/:action<br/>api_key (/v1*, /v1beta*) | admin_password (/api*)"]
-        MW["Onion Middleware Pipeline<br/>Ingress RateLimit → Guardrail (PII/Secret & Tool Block) → Context/Memory → MCP Bridge"]
-        IR["Lossless Canonical IR + Sidecar SignatureCache<br/>cache_control · thinking/signature · thought_signature · strict Tool Schema · UTF-8 SSE FSM + Drop Stop-Loss"]
-        RTR["Prefix-Cache Sticky + P2C Router<br/>Lock (Zero Silent Downgrade) | Stage-Aware | Per-Channel HTTP/SOCKS5 Proxy | Offline Fallback"]
-        DB[("Local SQLite WAL Trajectory Store<br/>Full Prompts Stay 100% Local<br/>Fork & Diff · Savings Dashboard · Redacted Export")]
-        API --> MW --> IR --> RTR
-        RTR --> DB
+        IN["Protocol Ingress & Split Auth<br/>/v1/messages · /v1/messages/count_tokens · /v1/chat/completions · /v1beta/models/:action<br/>api_key (/v1*, /v1beta*) | admin_password (/api*)"]
+        MW["Onion Middleware Pipeline<br/>Ingress RateLimit → Guardrail (PII/Secret Redaction & High-Risk Tool Block) → Context/Memory → MCP Bridge"]
+        IR["Lossless Canonical IR + Sidecar SignatureCache<br/>cache_control · thinking/signature · thought_signature · strict tools · UTF-8 SSE FSM + Drop Cancel"]
+        RT["Prefix-Cache Sticky + P2C Router + 4-Tier Error Governance (L1/L2/L3/L4)<br/>Lock | Stage-Aware | Per-Channel HTTP/SOCKS5 Proxy | Offline Fallback"]
+        SQL[("Local SQLite WAL Trajectory Store<br/>Raw Prompts Stay 100% Local<br/>Fork & Diff · Savings Dashboard · Redacted Export")]
+        IN --> MW --> IR --> RT --> SQL
     end
 
-    subgraph Upstreams["Upstream Providers"]
+    subgraph Upstreams["Upstream Channels"]
         U1["Cloud Providers<br/>Anthropic · OpenAI · Gemini"]
-        U2["Local Auto-Discovered Runtimes<br/>Ollama · LM Studio · vLLM (Offline Fallback)"]
+        U2["Auto-Discovered Local Runtimes<br/>Ollama · LM Studio · vLLM"]
     end
 
-    subgraph Cloud["Optional Cloud Control Plane (:8790)"]
-        CP["PostgreSQL Team Pool Hot-Sync<br/>Redis Lua 2PC Reserve/Settle Billing<br/>ClickHouse Desensitized Telemetry ONLY"]
-    end
-
-    Clients --> API
-    RTR --> U1
-    RTR -. "Auto-Fallback on Cloud Outage" .-> U2
-    Edge -. "SHA-256 Session Hash + Numeric Metrics ONLY" .-> Cloud
+    Agents --> IN
+    RT --> U1
+    RT -. "Auto-takeover if cloud channels trip/offline" .-> U2
 ```
 
 ---
 
-## Why LoomGate? (Comparison vs Traditional Proxies)
+## 5-Minute Quick Start
 
-| Capability | LoomGate v1.0.0 | Traditional HTTP Proxies (One-API / LiteLLM) | Single-Tool Switchers (CC-Switch) |
-|---|:---:|:---:|:---:|
-| **Lossless 3-Protocol Canonical IR** (`cache_control`, `thinking/signature`, `thought_signature`, `strict` schema) | Native Rust IR + Sidecar Cache | Often dropped or passthrough-only | No cross-protocol IR |
-| **Zero Silent Downgrade (`Lock` Mode)** + Explicit Transparent Headers | Strict `Lock` + `X-Gateway-Actual-Model` | Often silent model mapping | Config file swap only |
-| **Claude CLI `/v1/messages/count_tokens` Preflight** across OpenAI/Gemini | Built-in native + IR fallback | Frequently 404 on non-Anthropic | N/A |
-| **Mid-Stream `Ctrl+C` Stop-Loss** (Drop Cancel Propagation) | Instant TCP abort + WAL audit | Upstream keeps streaming/billing | No data plane |
-| **Local Model Auto-Discovery + Offline Fallback** (Ollama / LM Studio / vLLM) | `<= 350ms` parallel scan + 1-click import | Manual YAML/DB setup | No |
-| **Trajectory Fork & Diff + Guardrail-Redacted Export** (Markdown / SVG / PNG) | Local SQLite WAL + Canvas 2D Share Card | None | None |
-| **One React UI for Both Desktop & Docker Team Console** | Tauri v2 IPC + Browser REST (`sessionStorage`) | Web-only heavy stack | Desktop-only |
-| **Local-First Privacy** | Raw prompts stay 100% in local SQLite | Centralized server logs prompts | Local |
+### Step 1: Install & Start LoomGate (`127.0.0.1:8787`)
 
----
+Pick your preferred runtime (all three execute the same `gateway-core` microkernel):
 
-## 30-Second Quickstart
+- **Desktop App (Recommended)** — Download from **[GitHub Releases (`v1.0.0`)](https://github.com/yangdw2024/LoomGate/releases/tag/v1.0.0)**:
+  - **Windows**: `LoomGate_1.0.0_x64-setup.exe` (NSIS) or `LoomGate_1.0.0_x64_en-US.msi` (MSI)
+  - **macOS (Apple Silicon)**: `LoomGate_1.0.0_aarch64.dmg` (or `LoomGate_aarch64.app.tar.gz`)
+  - **Linux**: `LoomGate_1.0.0_amd64.AppImage`, `LoomGate_1.0.0_amd64.deb`, or `LoomGate-1.0.0-1.x86_64.rpm`
+  - Open **Channels & Routing** → click **+ Add Channel** (or **Scan Local Models** for Ollama/LM Studio/vLLM) → click **Test**.
 
-Choose whichever form fits your workflow — all three run the exact same `gateway-core` microkernel:
+- **Docker Compose (Gateway + Built-in Web Console at `http://localhost:8787`)**:
+  ```bash
+  git clone https://github.com/yangdw2024/LoomGate.git
+  cd LoomGate
+  docker compose -f deploy/docker-compose.yml up -d
+  ```
 
-### Option A: Native Desktop App (Zero Config)
-Download the pre-built installer from **[GitHub Releases](https://github.com/yangdw2024/LoomGate/releases)**:
-- **Windows**: `LoomGate_1.0.0_x64-setup.exe` (NSIS) or `.msi`
-- **macOS**: `LoomGate_1.0.0_aarch64.dmg`
-- **Linux**: `LoomGate_1.0.0_amd64.AppImage` / `.deb` / `.rpm`
+- **From Source (Rust Daemon)**:
+  ```bash
+  cp config.example.toml config.local.toml   # Edit with your real base_url & api_key (gitignored)
+  GATEWAY_CONFIG=config.local.toml cargo run -p gateway-daemon
+  ```
 
-Launch **LoomGate Studio** → click **Scan Local Models** or **+ Add Channel** → open **Client Integrations** to take over Claude Code / Codex / Gemini CLI or copy Cursor / Cline / Cherry Studio / Trae presets in one click.
+### Step 2: Connect Your Coding Agent (Copy-Paste)
 
-### Option B: Docker Compose (Gateway + Built-in Web Console)
+> **Tip**: In **LoomGate Desktop → Client Integrations**, Claude Code, Codex CLI, and Gemini CLI also support **one-click atomic config takeover** with automatic `.edge-gateway.bak` backup and lossless rollback. If you set an `api_key` in LoomGate, replace `local-loomgate` below with your key.
+
+#### Claude Code
 ```bash
-git clone https://github.com/yangdw2024/LoomGate.git
-cd LoomGate
-docker compose -f deploy/docker-compose.yml up -d
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+export ANTHROPIC_AUTH_TOKEN="local-loomgate"
+claude
 ```
-- **Web Control Studio**: open `http://localhost:8787` in your browser (supports `x-admin-password` stored only in ephemeral `sessionStorage` when `admin_password` is enabled).
-- **3-Protocol Gateway**: point any client to `http://localhost:8787`.
-- **Optional Cloud Control Plane**: add `--profile cloud` to launch `:8790` alongside the gateway.
+*(PowerShell: `$env:ANTHROPIC_BASE_URL="http://127.0.0.1:8787"; $env:ANTHROPIC_AUTH_TOKEN="local-loomgate"; claude`)*
 
-### Option C: Official npm SDK & CLI (`loomgate`)
+#### Codex CLI
+Add to `~/.codex/config.toml` (or click **Take Over** in LoomGate Studio):
+```toml
+openai_base_url = "http://127.0.0.1:8787/v1"
+```
+Or via environment variables:
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:8787/v1"
+export OPENAI_API_KEY="local-loomgate"
+```
+
+#### Gemini CLI
+```bash
+export GEMINI_API_BASE_URL="http://127.0.0.1:8787"
+export GEMINI_API_KEY="local-loomgate"
+gemini
+```
+
+#### Cursor
+1. Open **Cursor Settings → Models → OpenAI API Key**.
+2. Enable **Override OpenAI Base URL** and set:
+   ```text
+   http://127.0.0.1:8787/v1
+   ```
+3. Set API Key to `local-loomgate` (or your configured LoomGate `api_key`).
+
+#### Official npm CLI & TypeScript SDK (`loomgate`)
 ```bash
 npm install loomgate
-# or run CLI commands directly
 npx loomgate status
 npx loomgate local scan
 npx loomgate savings 30
@@ -112,49 +150,81 @@ npx loomgate diff-export <orig_step_id> <fork_step_id>
 
 ---
 
-## Full Client Integration Matrix
+## Benchmark & Cache Hit Proof (Reproducible Verification)
 
-Powered by the **Declarative Client Profile Registry** (`crates/gateway-core/src/cli_takeover.rs` & `GET /api/clients`) — extensible via `~/.loomgate/client_profiles.toml` or `.json` with zero Rust code changes:
+LoomGate ships two reproducible test harnesses in `tests/` so you can verify sticky cache affinity, mid-stream stop-loss, cross-protocol fidelity, and real-upstream savings yourself.
 
-| Client | Mode | What LoomGate Provides |
-|---|---|---|
-| **Claude Code** | Atomic Takeover | Patches `~/.claude/settings.json` with `.bak` lossless rollback + `/v1/messages/count_tokens` preflight. |
-| **Codex CLI** | Atomic Takeover | Patches `~/.codex/config.toml` atomically with one-click restore. |
-| **Gemini CLI** | Atomic Takeover | Patches `~/.gemini/settings.json` with native `thought_signature` sidecar hydration. |
-| **Cursor** | Setup Wizard | One-click copy `OPENAI_BASE_URL` & JSON config. |
-| **Cline / Roo Code** | Setup Wizard | Anthropic & OpenAI-compatible presets preserving `cache_control`. |
-| **Cherry Studio** | Setup Wizard | Unified multi-protocol provider snippet. |
-| **Trae** | Setup Wizard | OpenAI-compatible custom endpoint snippet. |
-| **Generic SDK** | Setup Wizard | Drop-in env vars for Python / TypeScript / Go / Rust SDKs. |
-| **Any Custom Agent** | User TOML / JSON | Drop `~/.loomgate/client_profiles.toml` — see [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md). |
+### 1. Automated 18/18 Conformance & Sticky-Routing Suite (Local Mock Cluster)
+Verifies deterministic routing invariants across a 4-channel cluster (Anthropic x2, OpenAI, Gemini) plus Cloud Control Plane:
+
+```bash
+# Build workspace binaries & Web Console static bundle
+cd apps/desktop && npm ci && npm run build && cd ../..
+cargo build -p gateway-daemon -p cloud-control-plane
+
+# Terminal 1: 4-channel mock upstream cluster (18081-18084)
+python3 tests/mock_upstream.py
+
+# Terminal 2: Optional cloud control plane (8790)
+./target/debug/cloud-control-plane
+
+# Terminal 3: LoomGate edge daemon with Web Console mounted (8787)
+GATEWAY_CONFIG=config.example.toml LOOMGATE_WEB_DIST=apps/desktop/dist ./target/debug/gateway-daemon
+
+# Terminal 4: Run all 18 conformance checks
+python3 tests/conformance_suite.py
+```
+
+Key verified invariants from `tests/conformance_suite.py`:
+- **Test 1 (Session Stickiness without `X-Session-Id`)**: 10-turn conversation pins to one channel from Turn 1 (`9/9` sticky hits, 100% affinity).
+- **Test 3 (Mid-Stream `Ctrl+C` Cancel Propagation)**: Aborts upstream TCP stream in `< 1s` (`aborted=1, completed=0`) and records `status=aborted_by_client` in SQLite WAL.
+- **Test 4 (4-Tier Error Governance)**: L1 in-place backoff retry, L2 cooldown failover, L3 quarantine + affinity unbind, L4 native 400 passthrough.
+- **Test 8 & 9 (3-Protocol Interop & `thought_signature` Sidecar Hydration)**: Anthropic ↔ OpenAI ↔ Gemini lossless translation + stripped `thoughtSignature` transparently restored on Turn 2.
+- **Test 15 & 16 (Local Auto-Discovery + Savings Aggregation)**: Detects mock Ollama + LM Studio in `< 400ms`, routes offline fallback cleanly, and aggregates cache-read & stop-loss USD savings.
+
+### 2. Live Upstream Cache Hit & Stop-Loss Benchmark (Fill with Your Real Run)
+Point `config.local.toml` at your real upstream account(s), start `gateway-daemon`, and run:
+
+```bash
+# Start daemon with your local (gitignored) config
+GATEWAY_CONFIG=config.local.toml cargo run -p gateway-daemon
+
+# Run live multi-turn caching, tool calling & Ctrl+C stop-loss verification
+python3 tests/live_upstream_verify.py \
+  --anthropic-model claude-sonnet-4-20250514 \
+  --openai-model gpt-4o
+
+# Inspect 30-day local SQLite savings summary
+npx loomgate savings 30
+```
+
+| Verified Run | Model / Cluster | Sticky Affinity | Tool Calling / Signature | `Ctrl+C` Stop-Loss | Observed Metrics |
+|---|---|---:|---|---|---|
+| **18/18 Conformance Cluster** (`tests/conformance_suite.py`) | 4-channel cluster (Anthropic x2, OpenAI, Gemini) | **9/9 (100% from Turn 1, no `X-Session-Id`)** | Stripped `thoughtSignature` restored on Turn 2 | `aborted=1, completed=0` (`< 1s` TCP abort) | 33 reqs, **42.2% avg cache hit**, `$0.03486` cache saved, local discovery **356–370 ms** |
+| **Live Upstream Run** (`tests/live_upstream_verify.py`) | `claude-sonnet-4-6` (Anthropic `/v1/messages`) | **2/2 (`X-Gateway-Sticky-Hit: true`)** | `tool_calls=1` round-trip passed | Persisted `aborted_by_client` (`$0.012` est. stop-loss) | 11,473 input / 371 output tokens; *note: upstream relay did not report provider KV cache counters* |
+| **Live Cross-Protocol Run** (`tests/live_upstream_verify.py`) | `gemini-3.8-flash` (Anthropic → Gemini native) | **`X-Gateway-Sticky-Hit: true`** | 820-byte `thoughtSignature` sidecar hydrated + `tool_use` round-trip | Persisted `aborted_by_client` | Zero schema loss across Anthropic → Gemini native translation |
+
+*(Run `python3 tests/live_upstream_verify.py` against direct Anthropic or OpenAI API keys to observe live provider-reported `cache_read_input_tokens` / `cached_tokens` in your local `Savings & Telemetry` tab.)*
 
 ---
 
-## Key Features
+## Visual Tour
 
-- **Pure GUI Channel Pool Management**: Hot-add/edit/toggle/delete/probe channels with automatic `base_url` normalization (strips redundant trailing `/v1` & `/v1beta`), per-channel HTTP/SOCKS5 `proxy_url`, Stage-Aware `fallback_models`, `quota_endpoint` probing, live 429 cooldown countdowns, and atomic persistence to `config.local.toml`.
-- **Local Model Auto-Discovery & Offline Fallback**: Parallel `<= 350ms` probe for Ollama (`:11434`), LM Studio (`:1234`), vLLM (`:8000`), and custom ports; import with `offline_fallback = true` so local models seamlessly catch requests if all cloud channels trip or go offline (`X-Gateway-Offline-Fallback: true`).
-- **Onion-Model Middleware Pipeline**: Symmetric `pre → terminal → post` layers (`IngressRateLimit` → `Guardrail` secret/PII redaction + high-risk tool interception → `ContextMemory` workspace injection → `McpBridge` `mcp__<server>__<tool>` aggregation).
-- **Trajectory Studio 2.0 & Savings Dashboard**: Every turn is persisted locally in SQLite WAL. Replay/fork any historical step onto another model, inspect line-level LCS diffs, view Prompt Caching & Ctrl+C stop-loss USD savings, and export Guardrail-redacted **Markdown reports**, **pure SVG**, or **pure Canvas 2D PNG share cards**.
-- **Edge-Cloud Hybrid Control Plane**: Optional `cloud-control-plane` (`crates/cloud-control-plane`) with PostgreSQL schema, Redis Lua atomic two-phase reserve/settle billing, and ClickHouse desensitized analytics.
+### P2C Channel Pool, Explicit Lock / Stage-Aware & Local Offline Fallback
+<img src="docs/assets/loomgate-dashboard-channels.png" alt="LoomGate Studio — P2C Upstream Channel Pool, Lock Mode, Local Ollama Offline Fallback, and Split Local Security" width="960" />
 
----
-
-## Privacy & Security Boundaries
-
-1. **Local-First by Architecture**: Full prompts, system instructions, tool calls, and responses live exclusively in your local SQLite WAL database. Cloud telemetry uses a strict schema containing only SHA-256 hashed session IDs and numeric/categorical metrics — and the Cloud Control Plane actively rejects any request carrying raw prompt/response fields.
-2. **Split Authentication**: Separate `api_key` (`/v1/*`, `/v1beta/*`) and `admin_password` (`/api/*`, `/__admin/*`), remaining passwordless on localhost when unset.
-3. **Export Guardrail**: Markdown reports and PNG/SVG share cards default to `redact_secrets = true`, automatically scrubbing `sk-*`, `Bearer <token>`, `AIza*`, `ghp_*`, `AKIA*`, emails, and phone numbers before export.
-4. See [`SECURITY.md`](SECURITY.md) for our complete security model and vulnerability reporting policy.
+### Local Prompt Caching Savings & `Ctrl+C` Stop-Loss Telemetry
+<img src="docs/assets/loomgate-savings-telemetry.png" alt="LoomGate Studio — Local Prompt Caching Savings, KV Hit Rate, and Ctrl+C Stop-Loss Dashboard" width="960" />
 
 ---
 
-## Extensions & Contributing
+## Extensions, Security & Contributing
 
-- **Extend LoomGate** (custom Agent Profiles, custom `Middleware` plugins, custom `ProtocolCodec` backends): [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)
-- **Contributing & Local Verification Gates**: [`CONTRIBUTING.md`](CONTRIBUTING.md)
-- **Release History**: [`CHANGELOG.md`](CHANGELOG.md)
+- **Extend LoomGate** (custom `~/.loomgate/client_profiles.toml`, custom Onion `Middleware` Trait, custom `ProtocolCodec` Trait): [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)
+- **Privacy & Security Model** (local SQLite WAL invariant, split `api_key` / `admin_password`, `sessionStorage`-only Web Console auth, Guardrail redaction): [`SECURITY.md`](SECURITY.md)
+- **Contributing & Local Green Gates**: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- **Full Release History**: [`CHANGELOG.md`](CHANGELOG.md)
 
 ## License
 
-[MIT](LICENSE)
+MIT — see [`LICENSE`](LICENSE).
